@@ -20,5 +20,8 @@
         <Version>0.0.1</Version>
         <Authors>CloudFabric Developers</Authors>
         <Company>CloudFabric</Company>
-    </PropertyGroup>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <RepositoryUrl>https://github.com/Tech-Fabric/CloudFabric.EventSourcing</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        </PropertyGroup>
 </Project>
