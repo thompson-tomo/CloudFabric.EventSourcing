@@ -5,6 +5,9 @@
 
 .idea
 
+# Environment files
+.env
+
 # User-specific files
 *.rsuser
 *.suo
@@ -350,3 +353,6 @@ MigrationBackup/
 
 # Ionide (cross platform F# VS Code tools) working folder
 .ionide/
+lcov-report
+CloudFabric.Projections.Clients.Ts/coverage
+CloudFabric.Projections.Clients.Ts/lib

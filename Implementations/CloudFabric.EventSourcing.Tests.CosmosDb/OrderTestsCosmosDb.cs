@@ -29,9 +29,6 @@ public class OrderTestsCosmosDb : OrderTests
          */
     private const string LeaseContainerName = "TestContainerLease";
 
-    private const string CosmosDbConnectionString =
-        "AccountEndpoint=https://cloudfabric-eventsourcing-test.documents.azure.com:443/;AccountKey=Va7mrZPPZfRcUMfcEL1GHorlvCSqiMxOBx5DadoaSKS8hSbJf3dGBVR0xRp8LuzVIWv8f8rSbPrKACDbXc9Adg==";
-
     private readonly Dictionary<Type, object> _projectionsRepositories = new();
 
     CosmosClient _cosmosClient = null;
@@ -90,7 +87,7 @@ public class OrderTestsCosmosDb : OrderTests
             };
 
             _cosmosClient = new CosmosClient(
-                CosmosDbConnectionString,
+                TestsConfiguration.CosmosDbConnectionString,
                 _cosmosClientOptions
             );
 
@@ -157,7 +154,7 @@ public class OrderTestsCosmosDb : OrderTests
     {
         return new CosmosDbProjectionRepositoryFactory(
             new LoggerFactory(),
-            CosmosDbConnectionString,
+            TestsConfiguration.CosmosDbConnectionString,
             _cosmosClientOptions,
             DatabaseName,
             ProjectionsContainerName

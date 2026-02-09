@@ -14,9 +14,6 @@ public class MetadataRepositoryTestsCosmosDb : MetadataRepositoryTests
     private const string DatabaseName = "TestDatabase";
     private const string ItemContainerName = "TestItemContainer";
 
-    private const string CosmosDbConnectionString =
-        "AccountEndpoint=https://localhost:8081/;AccountKey=C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
-
     CosmosClient _cosmosClient = null;
     CosmosClientOptions _cosmosClientOptions;
 
@@ -52,7 +49,7 @@ public class MetadataRepositoryTestsCosmosDb : MetadataRepositoryTests
         };
 
         _cosmosClient = new CosmosClient(
-            CosmosDbConnectionString,
+            TestsConfiguration.CosmosDbConnectionString,
             _cosmosClientOptions
         );
 
@@ -88,7 +85,7 @@ public class MetadataRepositoryTestsCosmosDb : MetadataRepositoryTests
             await SetUp();
 
             _metadataRepository = new CosmosDbMetadataRepository(
-                CosmosDbConnectionString,
+                TestsConfiguration.CosmosDbConnectionString,
                 _cosmosClientOptions,
                 DatabaseName,
                 ItemContainerName

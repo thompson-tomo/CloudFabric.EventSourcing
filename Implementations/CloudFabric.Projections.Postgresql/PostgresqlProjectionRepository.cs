@@ -694,8 +694,7 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         var propertySchema = schema.Properties.FirstOrDefault(p => p.PropertyName == nestedPath.First());
         if (propertySchema == null)
         {
-            Logger.LogWarning("Bad filter: schema {SchemaName} does not have property {PropertyName}", schema.SchemaName, propertyName);
-            return queryChunk;
+            throw new ProjectionQueryFilterException(propertyName, schema.SchemaName);
         }
         
         // Nested array check.

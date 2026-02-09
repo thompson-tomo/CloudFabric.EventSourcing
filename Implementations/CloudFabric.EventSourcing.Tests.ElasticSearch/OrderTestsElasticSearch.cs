@@ -24,7 +24,7 @@ public class OrderTestsElasticSearch : OrderTests
         if (_eventStore == null)
         {
             _eventStore = new PostgresqlEventStore(
-                "Host=localhost;Username=cloudfabric_eventsourcing_test;Password=cloudfabric_eventsourcing_test;Database=cloudfabric_eventsourcing_test;Maximum Pool Size=1000",
+                TestsConfiguration.PostgresConnectionString,
                 "orders_events",
                 "stored_items"
             );
@@ -40,7 +40,7 @@ public class OrderTestsElasticSearch : OrderTests
         {
             _projectionRepositoryFactory = new ElasticSearchProjectionRepositoryFactory(
                 new ElasticSearchBasicAuthConnectionSettings(
-                "http://127.0.0.1:9200",
+                TestsConfiguration.ElasticsearchUrl,
                 "",
                 "",
                 ""),

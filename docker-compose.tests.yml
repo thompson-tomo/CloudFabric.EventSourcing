@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cloudfabric_eventsourcing_postgres
+    environment:
+      POSTGRES_USER: cloudfabric_eventsourcing_test
+      POSTGRES_PASSWORD: cloudfabric_eventsourcing_test
+      POSTGRES_DB: cloudfabric_eventsourcing_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloudfabric_eventsourcing_test -d cloudfabric_eventsourcing_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.5.0
+    container_name: cloudfabric_eventsourcing_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - cluster.routing.allocation.disk.watermark.low=1gb
+      - cluster.routing.allocation.disk.watermark.high=500mb
+      - cluster.routing.allocation.disk.watermark.flood_stage=500mb
+    ports:
+      - "9222:9200"
+      - "9333:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # CosmosDB Emulator - опционально, работает медленно в Docker на Windows
+  # Рекомендуется использовать нативный эмулятор: https://aka.ms/cosmosdb-emulator
+  # cosmosdb:
+  #   image: mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:latest
+  #   container_name: cloudfabric_eventsourcing_cosmosdb
+  #   environment:
+  #     - AZURE_COSMOS_EMULATOR_PARTITION_COUNT=10
+  #     - AZURE_COSMOS_EMULATOR_ENABLE_DATA_PERSISTENCE=true
+  #     - AZURE_COSMOS_EMULATOR_IP_ADDRESS_OVERRIDE=127.0.0.1
+  #   ports:
+  #     - "8089:8081"
+  #     - "10260:10251"
+  #     - "10261:10252"
+  #     - "10262:10253"
+  #     - "10263:10254"
+  #   volumes:
+  #     - cosmosdb_data:/tmp/cosmos/appdata
+
+volumes:
+  postgres_data:
+  elasticsearch_data:
+  # cosmosdb_data:

@@ -1,6 +1,6 @@
 {
     "name": "@cloudfabric/filters-query-string",
-    "version": "1.0.5",
+    "version": "1.0.6",
     "description": "Complex filter expressions builder serializable to query string",
     "main": "lib/index.js",
     "scripts": {
