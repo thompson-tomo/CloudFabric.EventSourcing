@@ -5,7 +5,7 @@ namespace CloudFabric.Projections;
 
 public abstract class EventsObserver
 {
-    protected Func<IEvent, Task>? _eventHandler;
+    private Func<IEvent, Task>? _eventHandler;
     protected readonly ILogger<EventsObserver> _logger;
     protected readonly IEventStore _eventStore;
 
@@ -17,7 +17,7 @@ public abstract class EventsObserver
 
     public void SetEventHandler(Func<IEvent, Task> eventHandler)
     {
-        _eventHandler = eventHandler;
+        Volatile.Write(ref _eventHandler, eventHandler);
     }
 
     public abstract Task StartAsync(string instanceName);
@@ -51,8 +51,8 @@ public abstract class EventsObserver
     /// <param name="cancellationToken">This is a long-running operation, so make sure to pass correct CancellationToken here.</param>
     /// <returns></returns>
     public virtual async Task ReplayEventsAsync(
-        string instanceName, 
-        string? partitionKey, 
+        string instanceName,
+        string? partitionKey,
         DateTime? dateFrom,
         int chunkSize = 250,
         Func<int, IEvent, Task>? chunkProcessedCallback = null,
@@ -62,67 +62,68 @@ public abstract class EventsObserver
             instanceName,
             dateFrom
         );
-        
-        var lastEventDateTime = dateFrom;
+
+        string? continuationToken = null;
         var totalEventsProcessed = 0;
         var totalTime = TimeSpan.Zero;
-        
+
         while (true)
         {
             var loadEventsWatch = System.Diagnostics.Stopwatch.StartNew();
-            
-            var chunk = await _eventStore.LoadEventsAsync(
-                partitionKey, 
-                lastEventDateTime, 
-                chunkSize, 
+
+            var result = await _eventStore.LoadEventsAsync(
+                partitionKey,
+                dateFrom,
+                chunkSize,
+                continuationToken,
                 cancellationToken
             );
-            
+
             loadEventsWatch.Stop();
 
-            if (chunk.Count <= 0)
+            if (result.Events.Count <= 0)
             {
                 _logger.LogInformation(
                     "Finished replaying events on {InstanceName} starting from timestamp: {DateFrom}, total events processed: {TotalEventsProcessed}, " +
                     "time took: {TotalTimeTook}",
                     instanceName, dateFrom, totalEventsProcessed, totalTime
                 );
-                
+
                 break;
             }
-            
+
             var applyEventsWatch = System.Diagnostics.Stopwatch.StartNew();
 
-            foreach (var @event in chunk)
+            foreach (var @event in result.Events)
             {
                 await EventStoreOnEventAdded(@event);
             }
-            
+
             applyEventsWatch.Stop();
 
-            var lastEvent = chunk.Last();
-            lastEventDateTime = lastEvent.Timestamp;
-            totalEventsProcessed += chunk.Count;
+            continuationToken = result.ContinuationToken;
+            var lastEvent = result.Events.Last();
+            totalEventsProcessed += result.Events.Count;
             totalTime = totalTime.Add(loadEventsWatch.Elapsed).Add(applyEventsWatch.Elapsed);
-                
+
             _logger.LogInformation(
                 "Replayed chunk of {ReplayedEventsCount} on {InstanceName}, " +
                 "reading chunk took {ReadingEventsMs}ms, applying events took {ApplyEventsMs}ms, " +
-                "last event timestamp: {LastEventDateTime}", 
-                chunk.Count, instanceName,
+                "last event timestamp: {LastEventDateTime}",
+                result.Events.Count, instanceName,
                 loadEventsWatch.ElapsedMilliseconds, applyEventsWatch.ElapsedMilliseconds,
                 lastEvent.Timestamp
             );
 
             if (chunkProcessedCallback != null)
             {
-                await chunkProcessedCallback(chunk.Count, lastEvent);
+                await chunkProcessedCallback(result.Events.Count, lastEvent);
             }
 
             if (cancellationToken.IsCancellationRequested)
             {
-                _logger.LogInformation("Cancellation requested. Processed {TotalEventsProcessed} {InstanceName}", 
-                    totalEventsProcessed, 
+                _logger.LogInformation("Cancellation requested. Processed {TotalEventsProcessed} {InstanceName}",
+                    totalEventsProcessed,
                     instanceName
                 );
 
@@ -133,12 +134,14 @@ public abstract class EventsObserver
 
     protected async Task EventStoreOnEventAdded(IEvent e)
     {
-        if (_eventHandler == null)
+        var handler = Volatile.Read(ref _eventHandler);
+
+        if (handler == null)
         {
             throw new InvalidOperationException(
                 "Can't process an event: no eventHandler was set. Please call SetEventHandler before calling StartAsync.");
         }
 
-        await _eventHandler(e);
+        await handler(e);
     }
 }

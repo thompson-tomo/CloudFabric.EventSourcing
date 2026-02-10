@@ -4,11 +4,5 @@ namespace CloudFabric.EventSourcing.EventStore;
 
 public static class EventStoreSerializerOptions
 {
-    public static JsonSerializerOptions Options
-    {
-        get
-        {
-            return new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
-        }
-    }
+    public static readonly JsonSerializerOptions Options = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 }

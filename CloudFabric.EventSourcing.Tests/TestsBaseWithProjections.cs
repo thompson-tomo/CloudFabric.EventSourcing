@@ -36,8 +36,9 @@ public abstract class TestsBaseWithProjections<TProjectionDocument, TProjectionB
         {
             await ProjectionsRepository.DeleteAll();
         }
-        catch
+        catch (Exception ex)
         {
+            Console.WriteLine($"Initialize cleanup warning: {ex.Message}");
         }
         
         var repositoryEventsObserver = GetEventStoreEventsObserver();
@@ -90,8 +91,9 @@ public abstract class TestsBaseWithProjections<TProjectionDocument, TProjectionB
             var store = await GetEventStore();
             await store.DeleteAll();
         }
-        catch
+        catch (Exception ex)
         {
+            Console.WriteLine($"Cleanup warning (event store): {ex.Message}");
         }
 
         try
@@ -99,8 +101,9 @@ public abstract class TestsBaseWithProjections<TProjectionDocument, TProjectionB
             var projectionRepository = GetProjectionRepositoryFactory().GetProjectionRepository<TProjectionDocument>();
             await projectionRepository.DeleteAll();
         }
-        catch
+        catch (Exception ex)
         {
+            Console.WriteLine($"Cleanup warning (projections): {ex.Message}");
         }
     }
 }

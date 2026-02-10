@@ -96,6 +96,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CloudFabric.Projections.Wor
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ToDoList.Web", "Demos\ToDoList.Web\ToDoList.Web.csproj", "{10810335-7281-4EE3-9AC2-6FC6703674AF}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Filesystem", "Filesystem", "{DD45C14D-BA5C-4FD8-A367-D6E5A6679AFE}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CloudFabric.EventSourcing.EventStore.Filesystem", "Implementations\CloudFabric.EventSourcing.EventStore.Filesystem\CloudFabric.EventSourcing.EventStore.Filesystem.csproj", "{193128A1-4085-4ED2-B40D-4F9E1667ED93}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -234,6 +238,10 @@ Global
 		{10810335-7281-4EE3-9AC2-6FC6703674AF}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{10810335-7281-4EE3-9AC2-6FC6703674AF}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{10810335-7281-4EE3-9AC2-6FC6703674AF}.Release|Any CPU.Build.0 = Release|Any CPU
+		{193128A1-4085-4ED2-B40D-4F9E1667ED93}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{193128A1-4085-4ED2-B40D-4F9E1667ED93}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{193128A1-4085-4ED2-B40D-4F9E1667ED93}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{193128A1-4085-4ED2-B40D-4F9E1667ED93}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -270,6 +278,8 @@ Global
 		{F663B3C3-3242-411D-B543-92AFE3F3A7ED} = {B95E7A5F-FBFB-450B-B4E0-6F3E39C3DF81}
 		{071A59C3-D54A-4711-BDDC-FC458C200E92} = {48463EF2-9808-4F32-986E-D27C4B1E9A56}
 		{10810335-7281-4EE3-9AC2-6FC6703674AF} = {07858CA6-5352-4910-BBE7-2DDF524CFF67}
+		{DD45C14D-BA5C-4FD8-A367-D6E5A6679AFE} = {BEF8E4F3-BF56-4D98-939C-FDF2C89160DA}
+		{193128A1-4085-4ED2-B40D-4F9E1667ED93} = {DD45C14D-BA5C-4FD8-A367-D6E5A6679AFE}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {72905C16-2FA5-4C5E-8DAE-EBB916FA1C9F}

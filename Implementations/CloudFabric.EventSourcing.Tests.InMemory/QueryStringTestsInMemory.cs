@@ -19,7 +19,7 @@ public class QueryStringTestsInMemory : ProjectionQueryTest
         if (_eventStore == null)
         {
             _eventStore = new InMemoryEventStore(
-                new Dictionary<(Guid, string), List<string>>()
+                new System.Collections.Concurrent.ConcurrentDictionary<(Guid, string), List<string>>()
             );
             await _eventStore.Initialize();
         }

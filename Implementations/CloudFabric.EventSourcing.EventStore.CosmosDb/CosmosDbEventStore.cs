@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Net;
 using System.Text.Json;
@@ -10,6 +11,7 @@ namespace CloudFabric.EventSourcing.EventStore.CosmosDb;
 public class CosmosDbEventStore : IEventStore
 {
     private readonly CosmosClient _client;
+    private readonly bool _ownsClient;
     private readonly string _eventsContainerId;
     private readonly string _databaseId;
 
@@ -21,6 +23,7 @@ public class CosmosDbEventStore : IEventStore
     )
     {
         _client = new CosmosClient(connectionString, cosmosClientOptions);
+        _ownsClient = true;
         _databaseId = databaseId;
         _eventsContainerId = eventsContainerId;
     }
@@ -32,8 +35,19 @@ public class CosmosDbEventStore : IEventStore
     )
     {
         _client = client;
+        _ownsClient = false;
         _databaseId = databaseId;
         _eventsContainerId = eventsContainerId;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        if (_ownsClient)
+        {
+            _client.Dispose();
+        }
+
+        return ValueTask.CompletedTask;
     }
 
     public Task Initialize(CancellationToken cancellationToken = default)
@@ -52,7 +66,6 @@ public class CosmosDbEventStore : IEventStore
     {
         var stats = new EventStoreStatistics();
 
-        QueryDefinition totalCountQuery = new QueryDefinition($"SELECT * FROM {eventsContainer.Id}");
         IOrderedQueryable<EventWrapper> totalCountQueryable = eventsContainer.GetItemLinqQueryable<EventWrapper>();
         stats.TotalEventsCount = await totalCountQueryable.CountAsync();
 
@@ -164,11 +177,11 @@ public class CosmosDbEventStore : IEventStore
             }
         }
 
-        List<TransactionalBatchResponse> transactionalResults = new();
+        var transactionalResults = new ConcurrentBag<TransactionalBatchResponse>();
 
-        await Parallel.ForEachAsync(batches, async (batch, cancellationToken) =>
+        await Parallel.ForEachAsync(batches, cancellationToken, async (batch, ct) =>
             {
-                transactionalResults.Add(await batch.ExecuteAsync(CancellationToken.None).ConfigureAwait(false));
+                transactionalResults.Add(await batch.ExecuteAsync(ct).ConfigureAwait(false));
             }
         ).ConfigureAwait(false);
 
@@ -285,20 +298,22 @@ public class CosmosDbEventStore : IEventStore
         CancellationToken cancellationToken = default
     )
     {
-        if (events.GroupBy(x => x.PartitionKey).Count() != 1)
+        var eventsList = events as IList<IEvent> ?? events.ToList();
+
+        if (eventsList.GroupBy(x => x.PartitionKey).Count() != 1)
         {
             throw new ArgumentException("Partition keys for all events in the stream must be the same");
         }
 
         Container container = _client.GetContainer(_databaseId, _eventsContainerId);
 
-        PartitionKey cosmosPartitionKey = new PartitionKey(events.First().PartitionKey);
+        PartitionKey cosmosPartitionKey = new PartitionKey(eventsList[0].PartitionKey);
 
         dynamic[] parameters = new dynamic[]
         {
             streamId,
             expectedVersion,
-            SerializeEvents(eventUserInfo, streamId, expectedVersion, events)
+            SerializeEvents(eventUserInfo, streamId, expectedVersion, eventsList)
         };
 
         return await container.Scripts.ExecuteStoredProcedureAsync<bool>("spAppendToStream", cosmosPartitionKey, parameters, cancellationToken: cancellationToken);
@@ -333,20 +348,21 @@ public class CosmosDbEventStore : IEventStore
     }
     
     
-    public async Task<List<IEvent>> LoadEventsAsync(
-        string partitionKey,
-        DateTime? dateFrom,
+    public async Task<LoadEventsResult> LoadEventsAsync(
+        string? partitionKey,
+        DateTime? dateFrom = null,
         int chunkSize = 250,
+        string? continuationToken = null,
         CancellationToken cancellationToken = default
     ) {
         Container eventContainer = _client.GetContainer(_databaseId, _eventsContainerId);
-        
+
         DateTime endTime = DateTime.UtcNow;
 
         using var feedIterator = eventContainer
             .GetChangeFeedIterator<Change>(
-                dateFrom.HasValue 
-                    ? ChangeFeedStartFrom.Time(dateFrom.Value, FeedRange.FromPartitionKey(new PartitionKey(partitionKey))) 
+                dateFrom.HasValue
+                    ? ChangeFeedStartFrom.Time(dateFrom.Value, FeedRange.FromPartitionKey(new PartitionKey(partitionKey)))
                     : ChangeFeedStartFrom.Beginning(FeedRange.FromPartitionKey(new PartitionKey(partitionKey))),
                 ChangeFeedMode.Incremental,
                 new ChangeFeedRequestOptions
@@ -356,7 +372,7 @@ public class CosmosDbEventStore : IEventStore
             );
 
         var results = new List<IEvent>();
-        
+
         while (feedIterator.HasMoreResults)
         {
             FeedResponse<Change> response = await feedIterator.ReadNextAsync(cancellationToken);
@@ -366,8 +382,6 @@ public class CosmosDbEventStore : IEventStore
                 break;
             }
 
-            var totalEventsProcessed = 0;
-            
             if (response.StatusCode != HttpStatusCode.NotModified)
             {
                 var events = new ReadOnlyCollection<Change>(response.ToList());
@@ -376,6 +390,10 @@ public class CosmosDbEventStore : IEventStore
             }
         }
 
-        return results;
+        return new LoadEventsResult
+        {
+            Events = results,
+            ContinuationToken = null // CosmosDb change feed handles its own pagination
+        };
     }
 }

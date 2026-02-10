@@ -46,7 +46,10 @@ public class OrderRepository : IOrderRepository
                 aggregate.Version,
                 aggregate.UncommittedEvents);
 
-            aggregate.OnChangesSaved();
+            if (savedEvents)
+            {
+                aggregate.OnChangesSaved();
+            }
 
             return savedEvents;
         }

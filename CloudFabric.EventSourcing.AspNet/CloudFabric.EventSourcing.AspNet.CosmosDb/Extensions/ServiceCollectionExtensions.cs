@@ -5,6 +5,7 @@ using CloudFabric.Projections;
 using CloudFabric.Projections.CosmosDb;
 using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
@@ -24,16 +25,20 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
             string processorName
         )
         {
-            services.AddScoped<AggregateRepositoryFactory>((sp) =>
+            // CosmosClient is thread-safe and should be shared
+            var cosmosClient = new CosmosClient(connectionString, cosmosClientOptions);
+            var eventStore = new CosmosDbEventStore(cosmosClient, databaseId, eventsContainerId);
+
+            services.AddScoped<AggregateRepositoryFactory>(_ => new AggregateRepositoryFactory(eventStore));
+
+            var metadataRepository = new CosmosDbMetadataRepository(connectionString, cosmosClientOptions, databaseId, itemsContainerId);
+            services.AddScoped<IMetadataRepository>(_ => metadataRepository);
+
+            // Register change feed observer as singleton (background process)
+            services.AddSingleton<CosmosDbEventStoreChangeFeedObserver>(sp =>
             {
                 var logger = sp.GetRequiredService<ILogger<CosmosDbEventStoreChangeFeedObserver>>();
-                
-                var cosmosClient = new CosmosClient(connectionString, cosmosClientOptions);
-
-                var eventStore = new CosmosDbEventStore(cosmosClient, databaseId, eventsContainerId);
-                eventStore.Initialize().Wait();
-
-                var eventStoreObserver = new CosmosDbEventStoreChangeFeedObserver(
+                return new CosmosDbEventStoreChangeFeedObserver(
                     cosmosClient,
                     databaseId,
                     eventsContainerId,
@@ -43,16 +48,11 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
                     processorName,
                     logger
                 );
-
-                return new AggregateRepositoryFactory(eventStore);
             });
 
-            var metadataRepository = new CosmosDbMetadataRepository(connectionString, cosmosClientOptions, databaseId, itemsContainerId);
-
-            services.AddScoped<IMetadataRepository>(sp => metadataRepository);
-            
             return new EventSourcingBuilder
             {
+                EventStore = eventStore,
                 Services = services
             };
         }
@@ -65,7 +65,6 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
         )
         {
             var eventStore = new CosmosDbEventStore(client, databaseId, eventsContainerId);
-            eventStore.Initialize().Wait();
 
             return new EventSourcingBuilder
             {
@@ -81,7 +80,7 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
             {
                 throw new ArgumentException("Event store is missing");
             }
-            
+
             builder.Services.AddSingleton(sp => ActivatorUtilities.CreateInstance<TRepo>(sp, new object[] { builder.EventStore }));
             return builder;
         }
@@ -93,6 +92,8 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
             params Type[] projectionBuildersTypes
         )
         {
+            builder.ProjectionBuilderTypes = projectionBuildersTypes;
+
             var projectionsRepositoryFactory = new CosmosDbProjectionRepositoryFactory(
                 projectionsConnectionInfo.LoggerFactory,
                 projectionsConnectionInfo.ConnectionString,
@@ -101,38 +102,39 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
                 projectionsConnectionInfo.ContainerId
             );
 
-            // TryAddScoped is used to be able to add a few event stores with separate calls of AddPostgresqlProjections
-            builder.Services.AddScoped<ProjectionRepositoryFactory>((sp) => projectionsRepositoryFactory);
-            
-            // // add repository for saving rebuild states
-            // var projectionStateRepository = new CosmosDbProjectionRepository<ProjectionRebuildState>(
-            //     projectionsConnectionInfo.LoggerFactory,
-            //     projectionsConnectionInfo.ConnectionString,
-            //     projectionsConnectionInfo.CosmosClientOptions,
-            //     projectionsConnectionInfo.DatabaseId,
-            //     projectionsConnectionInfo.ContainerId
-            // );
+            builder.Services.AddScoped<ProjectionRepositoryFactory>(_ => projectionsRepositoryFactory);
 
-            // TODO: this needs refactoring to scoped (see postgresql example)
-            // var projectionsEngine = new ProjectionsEngine();
-            //
-            // if (builder.ProjectionEventsObserver == null)
-            // {
-            //     throw new ArgumentException("Projection events observer is missing");
-            // }
-            //
-            // projectionsEngine.SetEventsObserver(builder.ProjectionEventsObserver);
-            //
-            // foreach (var projectionBuilderType in projectionBuildersTypes)
-            // {
-            //     var projectionBuilder = builder.ConstructProjectionBuilder(
-            //         projectionBuilderType, 
-            //         projectionsRepositoryFactory, new AggregateRepositoryFactory(builder.EventStore), serviceProvider, ProjectionOperationIndexSelector.Write);
-            //     
-            //     projectionsEngine.AddProjectionBuilder(projectionBuilder);
-            // }
+            // CosmosDb uses change feed which is a global background process,
+            // so ProjectionsEngine is singleton (unlike PostgreSQL's per-request pattern).
+            builder.Services.AddSingleton<ProjectionsEngine>(sp =>
+            {
+                var projectionsEngine = new ProjectionsEngine();
 
-            //builder.ProjectionsEngine = projectionsEngine;
+                var changeFeedObserver = sp.GetRequiredService<CosmosDbEventStoreChangeFeedObserver>();
+                projectionsEngine.SetEventsObserver(changeFeedObserver);
+
+                foreach (var projectionBuilderType in projectionBuildersTypes)
+                {
+                    var projectionBuilder = builder.ConstructProjectionBuilder(
+                        projectionBuilderType,
+                        projectionsRepositoryFactory,
+                        new AggregateRepositoryFactory(builder.EventStore),
+                        sp,
+                        ProjectionOperationIndexSelector.Write
+                    );
+
+                    projectionsEngine.AddProjectionBuilder(projectionBuilder);
+                }
+
+                return projectionsEngine;
+            });
+
+            // Hosted service starts/stops the change feed observer via ProjectionsEngine
+            builder.Services.AddSingleton<IHostedService>(sp =>
+            {
+                var engine = sp.GetRequiredService<ProjectionsEngine>();
+                return new CosmosDbProjectionsHostedService(engine);
+            });
 
             return builder;
         }

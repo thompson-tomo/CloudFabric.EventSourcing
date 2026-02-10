@@ -527,8 +527,8 @@ public class PostgresqlProjectionRepository : ProjectionRepository
 
         sb.Append(" GROUP BY id");
 
-        // total count query
-        string totalCountQuery = $"SELECT COUNT(*) FROM {string.Join(", ", fromStatements)}";
+        // total count query — use COUNT(DISTINCT id) to avoid inflated counts from jsonb_array_elements joins
+        string totalCountQuery = $"SELECT COUNT(DISTINCT id) FROM {string.Join(", ", fromStatements)}";
         if (!string.IsNullOrEmpty(queryChunk.WhereChunk))
         {
             totalCountQuery += $" WHERE {queryChunk.WhereChunk}";
@@ -541,7 +541,21 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         {
             // NOTE: nested sorting is not implemented
             sb.Append(" ORDER BY ");
-            sb.AppendJoin(',', projectionQuery.OrderBy.Select(kv => $"{kv.KeyPath} {kv.Order}"));
+            sb.AppendJoin(',', projectionQuery.OrderBy.Select(kv =>
+            {
+                if (!Regex.IsMatch(kv.KeyPath, @"^[a-zA-Z_][a-zA-Z0-9_.]*$"))
+                {
+                    throw new ProjectionQueryFilterException($"Invalid sort key: {kv.KeyPath}");
+                }
+
+                if (!string.Equals(kv.Order, "asc", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(kv.Order, "desc", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new ProjectionQueryFilterException($"Invalid sort order: {kv.Order}");
+                }
+
+                return $"{kv.KeyPath} {kv.Order}";
+            }));
         }
         
         if (projectionQuery.Limit.HasValue)
@@ -559,12 +573,11 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         try
         {
             // calculate total count
-            var totalCountCmd = new NpgsqlCommand(totalCountQuery, conn);
+            await using var totalCountCmd = new NpgsqlCommand(totalCountQuery, conn);
             totalCountCmd.Parameters.AddRange(totalCountParams);
 
             var totalCount = await totalCountCmd.ExecuteScalarAsync(cancellationToken) as long?;
             totalCountCmd.Parameters.Clear();
-            totalCountCmd.Dispose();
 
             var commandText = sb.ToString();
             
@@ -573,9 +586,9 @@ public class PostgresqlProjectionRepository : ProjectionRepository
                 string.Join(", ", queryChunk.Parameters.Select(p => $"{p.ParameterName} = {p.Value}"))
             );
             
-            var cmd = new NpgsqlCommand(sb.ToString(), conn);
+            await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
             cmd.Parameters.AddRange(queryChunk.Parameters.ToArray());
-            
+
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
 
             var records = new List<Dictionary<string, object?>>();
@@ -642,11 +655,6 @@ public class PostgresqlProjectionRepository : ProjectionRepository
                     $"{string.Join(',', cmd.Parameters.Select(p => $"@{p.ParameterName}:{p.NpgsqlDbType}={p.NpgsqlValue}"))}";
             }
 
-            await reader.DisposeAsync();
-            // clear previous command in order to prevent conflicts
-            cmd.Parameters.Clear();
-            cmd.Dispose();
-            
             return new ProjectionQueryResult<Dictionary<string, object?>>
             {
                 DebugInformation = _includeDebugInformation ? debugInformation : String.Empty, 
@@ -771,6 +779,10 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         else if (filter.Value is int)
         {
             propertyName = $"({propertyName})::int";
+        }
+        else if (filter.Value is long)
+        {
+            propertyName = $"({propertyName})::bigint";
         }
         else if (filter.Value is decimal)
         {

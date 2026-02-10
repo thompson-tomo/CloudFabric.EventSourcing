@@ -5,7 +5,9 @@ using CloudFabric.Projections;
 using CloudFabric.Projections.Postgresql;
 using CloudFabric.Projections.Worker;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
 {
@@ -92,7 +94,7 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
                             }
                         }
 
-                        scope.ProjectionsEngine.StartAsync(connectionInformationProvider.GetConnectionInformation().ConnectionId).GetAwaiter().GetResult();
+                        scope.ProjectionsEngine.Start(connectionInformationProvider.GetConnectionInformation().ConnectionId);
                     }
 
                     scope.MetadataRepository = new PostgresqlMetadataRepository(connectionInformationProvider);
@@ -189,19 +191,21 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
 
         public static IEventSourcingBuilder AddProjectionsRebuildProcessor(this IEventSourcingBuilder builder)
         {
-            builder.Services.AddSingleton<ProjectionsRebuildProcessor>(
+            // Register as IHostedService directly so the scope is owned by the hosted service
+            // and properly disposed on shutdown via IDisposable.
+            builder.Services.AddSingleton<IHostedService>(
                 (sp) =>
                 {
                     var rebuildProcessorScope = sp.CreateScope();
 
-                    return new ProjectionsRebuildProcessor(
+                    var processor = new ProjectionsRebuildProcessor(
                         rebuildProcessorScope.ServiceProvider.GetRequiredKeyedService<ProjectionRepositoryFactory>(builder.EventStoreKey)
                             .GetProjectionsIndexStateRepository(),
                         async (string connectionId) =>
                         {
                             var connectionInformationProvider = rebuildProcessorScope.ServiceProvider
                                 .GetRequiredKeyedService<IPostgresqlEventStoreConnectionInformationProvider>(builder.EventStoreKey);
-                            
+
                             var connectionInformation = connectionInformationProvider.GetConnectionInformation(connectionId);
                             var eventStore = new PostgresqlEventStore(
                                 connectionInformation.ConnectionString, connectionInformation.TableName, connectionInformation.MetadataTableName
@@ -229,18 +233,19 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
 
                             projectionsEngine.SetEventsObserver(eventObserver);
 
-                            // no need to listen - we are attaching this projections engine to test event store which is already being observed
-                            // by tests projections engine (see PrepareProjections method)
-                            //await projectionsEngine.StartAsync("TestInstance");
-
                             return projectionsEngine;
                         },
                         rebuildProcessorScope.ServiceProvider.GetRequiredService<ILogger<ProjectionsRebuildProcessor>>()
                     );
+
+                    var options = sp.GetRequiredService<IOptions<ProjectionsRebuildProcessorOptions>>();
+                    return new ProjectionsRebuildProcessorHostedService(
+                        processor,
+                        options,
+                        onDispose: () => rebuildProcessorScope.Dispose()
+                    );
                 }
             );
-
-            builder.Services.AddHostedService<ProjectionsRebuildProcessorHostedService>();
 
             return builder;
         }

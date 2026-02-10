@@ -31,7 +31,9 @@ public class EventSourcingBuilder : IEventSourcingBuilder
     {
         dynamic? projectionBuilder = null;
 
-        ConstructorInfo projectionBuilderConstructor = projectionBuilderType.GetConstructors().First();
+        ConstructorInfo projectionBuilderConstructor = projectionBuilderType.GetConstructors()
+            .OrderByDescending(c => c.GetParameters().Length)
+            .First();
 
         var constructorArguments = new List<dynamic>();
         foreach (var arg in projectionBuilderConstructor.GetParameters())
@@ -56,11 +58,10 @@ public class EventSourcingBuilder : IEventSourcingBuilder
             }
         }
 
-        // There are two types of projection builders: 
+        // There are two types of projection builders:
         // First one is ProjectionBuilder<ProjectionDocument> and works with strict projection documents represented by class
         // Second one is just ProjectionBuilder - those projections do not have strict schema and work with raw dictionary {key: value} type of documents.
-        if (projectionBuilderType?.BaseType?.GenericTypeArguments.Length > 0 &&
-            projectionBuilderType.BaseType.GenericTypeArguments.Any(ta => ta.BaseType == typeof(ProjectionDocument)))
+        if (IsTypedProjectionBuilder(projectionBuilderType))
         {
             projectionBuilder = (IProjectionBuilder<ProjectionDocument>?)Activator.CreateInstance(
                 projectionBuilderType, constructorArguments.ToArray()
@@ -79,6 +80,21 @@ public class EventSourcingBuilder : IEventSourcingBuilder
         }
 
         return projectionBuilder;
+    }
+
+    private static bool IsTypedProjectionBuilder(Type? type)
+    {
+        while (type != null)
+        {
+            if (type.IsGenericType && type.GetGenericArguments().Any(ta => typeof(ProjectionDocument).IsAssignableFrom(ta)))
+            {
+                return true;
+            }
+
+            type = type.BaseType;
+        }
+
+        return false;
     }
 
     public async Task InitializeEventStore(IServiceProvider serviceProvider)

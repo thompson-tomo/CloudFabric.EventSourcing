@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Linq;
 using CloudFabric.Projections;
 using ToDoList.Domain.Events.TaskLists;
 
@@ -9,8 +11,10 @@ public class TaskListsProjectionBuilder : ProjectionBuilder<TaskListProjectionIt
     IHandleEvent<TaskListNameUpdated>,
     IHandleEvent<TaskListPositionUpdated>,
     IHandleEvent<TaskCreated>,
-    IHandleEvent<TaskCompletedStatusUpdpated>,
-    IHandleEvent<TaskPositionUpdated>
+    IHandleEvent<TaskCompletedStatusUpdated>,
+    IHandleEvent<TaskPositionUpdated>,
+    IHandleEvent<TaskListSharedWithUser>,
+    IHandleEvent<TaskListShareRevoked>
 {
     public TaskListsProjectionBuilder(
         ProjectionRepositoryFactory projectionRepositoryFactory, 
@@ -31,7 +35,8 @@ public class TaskListsProjectionBuilder : ProjectionBuilder<TaskListProjectionIt
                 UpdatedAt = evt.Timestamp,
                 TasksCount = 0,
                 ClosedTasksCount = 0,
-                OpenTasksCount = 0
+                OpenTasksCount = 0,
+                SharedUsers = new List<TaskListShareProjection>()
             },
             evt.PartitionKey,
             evt.Timestamp
@@ -75,11 +80,12 @@ public class TaskListsProjectionBuilder : ProjectionBuilder<TaskListProjectionIt
             (projectionDocument) =>
             {
                 projectionDocument.TasksCount += 1;
+                projectionDocument.OpenTasksCount += 1;
             }
         );
     }
 
-    public async System.Threading.Tasks.Task On(TaskCompletedStatusUpdpated evt)
+    public async System.Threading.Tasks.Task On(TaskCompletedStatusUpdated evt)
     {
         await UpdateDocument(
             evt.TaskListId,
@@ -126,6 +132,52 @@ public class TaskListsProjectionBuilder : ProjectionBuilder<TaskListProjectionIt
                 {
                     projectionDocument.OpenTasksCount += 1;
                 }
+            }
+        );
+    }
+
+    public async System.Threading.Tasks.Task On(TaskListSharedWithUser evt)
+    {
+        await UpdateDocument(
+            evt.TaskListId,
+            evt.PartitionKey,
+            evt.Timestamp,
+            projectionDocument =>
+            {
+                projectionDocument.SharedUsers ??= new List<TaskListShareProjection>();
+                var existingShare = projectionDocument.SharedUsers.FirstOrDefault(s => s.SharedUserId == evt.SharedUserId);
+
+                if (existingShare == null)
+                {
+                    projectionDocument.SharedUsers.Add(new TaskListShareProjection
+                    {
+                        SharedUserId = evt.SharedUserId,
+                        SharedUserEmail = evt.SharedUserEmail,
+                        CanEdit = evt.CanEdit
+                    });
+                }
+                else
+                {
+                    existingShare.SharedUserEmail = evt.SharedUserEmail;
+                    existingShare.CanEdit = evt.CanEdit;
+                }
+
+                projectionDocument.UpdatedAt = evt.Timestamp;
+            }
+        );
+    }
+
+    public async System.Threading.Tasks.Task On(TaskListShareRevoked evt)
+    {
+        await UpdateDocument(
+            evt.TaskListId,
+            evt.PartitionKey,
+            evt.Timestamp,
+            projectionDocument =>
+            {
+                projectionDocument.SharedUsers ??= new List<TaskListShareProjection>();
+                projectionDocument.SharedUsers.RemoveAll(s => s.SharedUserId == evt.SharedUserId);
+                projectionDocument.UpdatedAt = evt.Timestamp;
             }
         );
     }

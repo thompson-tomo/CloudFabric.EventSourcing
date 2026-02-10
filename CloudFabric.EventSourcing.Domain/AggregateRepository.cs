@@ -92,7 +92,10 @@ public class AggregateRepository<T> : IAggregateRepository<T> where T : Aggregat
                 cancellationToken
             );
 
-            aggregate.OnChangesSaved();
+            if (eventsSavedSuccessfully)
+            {
+                aggregate.OnChangesSaved();
+            }
 
             return eventsSavedSuccessfully;
         }

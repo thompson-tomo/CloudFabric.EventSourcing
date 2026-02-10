@@ -1,20 +1,26 @@
+using System.Collections.Immutable;
 using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.Projections.Queries;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CloudFabric.Projections;
 
 public class ProjectionsEngine : IProjectionsEngine
 {
-    private readonly List<IProjectionBuilder<ProjectionDocument>> _projectionBuilders = new();
-    private readonly List<IProjectionBuilder> _dynamicProjectionBuilders = new();
-    
-    private EventsObserver? _observer;
-    //private readonly IProjectionRepository<ProjectionRebuildState> _projectionsStateRepository;
+    private ImmutableList<IProjectionBuilder<ProjectionDocument>> _projectionBuilders = ImmutableList<IProjectionBuilder<ProjectionDocument>>.Empty;
+    private ImmutableList<IProjectionBuilder> _dynamicProjectionBuilders = ImmutableList<IProjectionBuilder>.Empty;
 
-    public ProjectionsEngine(
-        //IProjectionRepository<ProjectionRebuildState> projectionsStateRepository
-    ) {
-        //_projectionsStateRepository = projectionsStateRepository;
+    private EventsObserver? _observer;
+    private readonly ILogger<ProjectionsEngine> _logger;
+
+    public ProjectionsEngine(ILogger<ProjectionsEngine> logger)
+    {
+        _logger = logger;
+    }
+
+    public ProjectionsEngine() : this(NullLogger<ProjectionsEngine>.Instance)
+    {
     }
 
     public Task StartAsync(string instanceName)
@@ -25,6 +31,26 @@ public class ProjectionsEngine : IProjectionsEngine
         }
 
         return _observer.StartAsync(instanceName);
+    }
+
+    /// <summary>
+    /// Synchronous version of StartAsync for observers whose StartAsync completes synchronously
+    /// (e.g. InMemory, PostgreSQL). Throws if the observer's StartAsync does not complete immediately.
+    /// </summary>
+    public void Start(string instanceName)
+    {
+        if (_observer == null)
+        {
+            throw new InvalidOperationException("SetEventsObserver should be called before Start");
+        }
+
+        var task = _observer.StartAsync(instanceName);
+        if (!task.IsCompletedSuccessfully)
+        {
+            throw new InvalidOperationException(
+                "Observer's StartAsync did not complete synchronously. " +
+                "Use StartAsync() for observers with asynchronous initialization (e.g. CosmosDb change feed).");
+        }
     }
 
     public Task StopAsync()
@@ -45,46 +71,13 @@ public class ProjectionsEngine : IProjectionsEngine
 
     public void AddProjectionBuilder(IProjectionBuilder<ProjectionDocument> projectionBuilder)
     {
-        _projectionBuilders.Add(projectionBuilder);
+        ImmutableInterlocked.Update(ref _projectionBuilders, list => list.Add(projectionBuilder));
     }
-    
+
     public void AddProjectionBuilder(IProjectionBuilder projectionBuilder)
     {
-        _dynamicProjectionBuilders.Add(projectionBuilder);
+        ImmutableInterlocked.Update(ref _dynamicProjectionBuilders, list => list.Add(projectionBuilder));
     }
-    //
-    // /// <summary>
-    // /// Starts rebuilding of a projection. Note that this method returns instantly and rebuild continues in the background.
-    // /// use `GetRebuildState` method to track the progress.
-    // /// </summary>
-    // /// <param name="instanceName">
-    // /// The name of current rebuild processor. Can be any string.
-    // /// Used to identify and track different rebuild processes.</param>
-    // /// <param name="partitionKey">Partition of events to process</param>
-    // /// <param name="dateFrom"></param>
-    // /// <exception cref="InvalidOperationException"></exception>
-    // public async Task StartRebuildAsync(string instanceName, string partitionKey, DateTime? dateFrom = null)
-    // {
-    //     if (_observer == null)
-    //     {
-    //         throw new InvalidOperationException("SetEventsObserver should be called before RebuildAsync");
-    //     }
-    //
-    //     await _projectionsStateRepository.EnsureIndex();
-    //     
-    //     await _projectionsStateRepository.Upsert(new ProjectionRebuildState
-    //     {
-    //         Id = Guid.NewGuid(),
-    //         PartitionKey = partitionKey,
-    //         InstanceName = instanceName,
-    //         Status = RebuildStatus.Running
-    //     }, 
-    //     partitionKey,
-    //     DateTime.UtcNow);
-    //
-    //     // run in background
-    //     _observer.LoadAndHandleEventsAsync(instanceName, partitionKey, dateFrom, OnRebuildCompleted, OnRebuildFailed);
-    // }
 
     public async Task RebuildOneAsync(Guid documentId, string partitionKey)
     {
@@ -92,56 +85,71 @@ public class ProjectionsEngine : IProjectionsEngine
         {
             throw new InvalidOperationException("SetEventsObserver should be called before RebuildAsync");
         }
-        
+
         await _observer.ReplayEventsForOneDocumentAsync(documentId, partitionKey);
     }
 
-    // public async Task<ProjectionRebuildState?> GetRebuildState(string instanceName, string partitionKey)
-    // {
-    //     var rebuildState = (await _projectionsStateRepository.Query(
-    //         ProjectionQueryExpressionExtensions.Where<ProjectionRebuildState>(x => x.InstanceName == instanceName),
-    //         partitionKey: partitionKey
-    //     ))
-    //     .Records
-    //     .LastOrDefault();
-    //
-    //     return rebuildState?.Document;
-    // }
-
     private async Task HandleEvent(IEvent @event)
     {
-        foreach (var projectionBuilder in
-                 _projectionBuilders.Where(p => p.HandledEventTypes.Contains(@event.GetType())))
+        var eventType = @event.GetType();
+
+        foreach (var projectionBuilder in _projectionBuilders)
         {
-            await projectionBuilder.ApplyEvent(@event); 
+            if (!projectionBuilder.HandledEventTypes.Contains(eventType))
+            {
+                continue;
+            }
+
+            try
+            {
+                await projectionBuilder.ApplyEvent(@event);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Projection builder {BuilderType} failed to handle event {EventType} for aggregate {AggregateId}",
+                    projectionBuilder.GetType().Name, eventType.Name, @event.AggregateId);
+            }
         }
-        
-        foreach (var projectionBuilder in
-                 _dynamicProjectionBuilders.Where(p => p.HandledEventTypes.Contains(@event.GetType())))
+
+        foreach (var projectionBuilder in _dynamicProjectionBuilders)
         {
-            await projectionBuilder.ApplyEvent(@event); 
+            if (!projectionBuilder.HandledEventTypes.Contains(eventType))
+            {
+                continue;
+            }
+
+            try
+            {
+                await projectionBuilder.ApplyEvent(@event);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Dynamic projection builder {BuilderType} failed to handle event {EventType} for aggregate {AggregateId}",
+                    projectionBuilder.GetType().Name, eventType.Name, @event.AggregateId);
+            }
         }
-        
+
         #region Apply AggregateUpdatedEvent to projection builders
 
         var aggregateType = Type.GetType(@event.AggregateType);
 
         if (aggregateType == null)
         {
-            throw new Exception($"Failed to get type of aggregate {@event.AggregateType}");
+            _logger.LogWarning("Failed to get type of aggregate {AggregateType}, skipping AggregateUpdatedEvent dispatch", @event.AggregateType);
+            return;
         }
-        
+
         var aggregateUpdatedEventType = typeof(AggregateUpdatedEvent<>).MakeGenericType(aggregateType);
 
         var buildersWithAggregateUpdatedEvent = _projectionBuilders.Where(
-            p => !p.HandledEventTypes.Contains(@event.GetType()) && p.HandledEventTypes.Contains(aggregateUpdatedEventType)
+            p => !p.HandledEventTypes.Contains(eventType) && p.HandledEventTypes.Contains(aggregateUpdatedEventType)
         ).ToList();
 
         var dynamicBuildersWithAggregateUpdatedEvent = _dynamicProjectionBuilders.Where(
-            p => !p.HandledEventTypes.Contains(@event.GetType()) && p.HandledEventTypes.Contains(aggregateUpdatedEventType)
+            p => !p.HandledEventTypes.Contains(eventType) && p.HandledEventTypes.Contains(aggregateUpdatedEventType)
         ).ToList();
 
-        if (buildersWithAggregateUpdatedEvent.Any() || dynamicBuildersWithAggregateUpdatedEvent.Any())
+        if (buildersWithAggregateUpdatedEvent.Count > 0 || dynamicBuildersWithAggregateUpdatedEvent.Count > 0)
         {
             var aggregateUpdatedEvent = (IEvent)Activator.CreateInstance(aggregateUpdatedEventType)!;
             aggregateUpdatedEvent.AggregateId = @event.AggregateId;
@@ -151,12 +159,28 @@ public class ProjectionsEngine : IProjectionsEngine
 
             foreach (var projectionBuilder in buildersWithAggregateUpdatedEvent)
             {
-                await projectionBuilder.ApplyEvent(aggregateUpdatedEvent);
+                try
+                {
+                    await projectionBuilder.ApplyEvent(aggregateUpdatedEvent);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Projection builder {BuilderType} failed to handle AggregateUpdatedEvent for aggregate {AggregateId}",
+                        projectionBuilder.GetType().Name, @event.AggregateId);
+                }
             }
 
             foreach (var projectionBuilder in dynamicBuildersWithAggregateUpdatedEvent)
             {
-                await projectionBuilder.ApplyEvent(aggregateUpdatedEvent);
+                try
+                {
+                    await projectionBuilder.ApplyEvent(aggregateUpdatedEvent);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Dynamic projection builder {BuilderType} failed to handle AggregateUpdatedEvent for aggregate {AggregateId}",
+                        projectionBuilder.GetType().Name, @event.AggregateId);
+                }
             }
         }
 
@@ -164,8 +188,8 @@ public class ProjectionsEngine : IProjectionsEngine
     }
 
     public async Task ReplayEventsAsync(
-        string instanceName, 
-        string? partitionKey, 
+        string instanceName,
+        string? partitionKey,
         DateTime? dateFrom,
         int chunkSize = 250,
         Func<int, IEvent, Task>? chunkProcessedCallback = null,
@@ -175,10 +199,10 @@ public class ProjectionsEngine : IProjectionsEngine
         {
             throw new InvalidOperationException("SetEventsObserver should be called before ReplayEventsAsync");
         }
-        
+
         await _observer.ReplayEventsAsync(
-            instanceName, 
-            partitionKey, 
+            instanceName,
+            partitionKey,
             dateFrom,
             chunkSize,
             chunkProcessedCallback,
@@ -186,55 +210,13 @@ public class ProjectionsEngine : IProjectionsEngine
         );
     }
 
-    //
-    // private async Task OnRebuildCompleted(string instanceName, string partitionKey)
-    // {
-    //     var rebuildState = (await _projectionsStateRepository.Query(
-    //         ProjectionQueryExpressionExtensions.Where<ProjectionRebuildState>(x => x.InstanceName == instanceName)
-    //     ))
-    //     .Records
-    //     .Select(x => x.Document)
-    //     .FirstOrDefault();
-    //     
-    //     if (rebuildState == null)
-    //     {
-    //         rebuildState = new ProjectionRebuildState
-    //         {
-    //             Id = Guid.NewGuid(),
-    //             InstanceName = instanceName
-    //         };
-    //     }
-    //     
-    //     rebuildState.Status = RebuildStatus.Completed;
-    //
-    //     await _projectionsStateRepository.Upsert(rebuildState, partitionKey, DateTime.UtcNow);
-    // }
-    //
-    // private async Task OnRebuildFailed(string instanceName, string partitionKey, string errorMessage)
-    // {
-    //     var rebuildState = (await _projectionsStateRepository.Query(
-    //         ProjectionQueryExpressionExtensions.Where<ProjectionRebuildState>(x => x.InstanceName == instanceName)
-    //     ))
-    //     .Records
-    //     .Select(x => x.Document)
-    //     .FirstOrDefault();
-    //     
-    //     if (rebuildState == null)
-    //     {
-    //         rebuildState = new ProjectionRebuildState
-    //         {
-    //             Id = Guid.NewGuid(),
-    //             InstanceName = instanceName
-    //         };
-    //     }
-    //     
-    //     rebuildState.Status = RebuildStatus.Failed;
-    //     rebuildState.ErrorMessage = errorMessage;
-    //
-    //     await _projectionsStateRepository.Upsert(rebuildState, partitionKey, DateTime.UtcNow);
-    // }
     public async Task<EventStoreStatistics> GetEventStoreStatistics()
     {
+        if (_observer == null)
+        {
+            throw new InvalidOperationException("SetEventsObserver should be called before GetEventStoreStatistics");
+        }
+
         return await _observer.GetEventStoreStatistics();
     }
 }

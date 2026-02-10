@@ -4,8 +4,6 @@ using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.Tests.Domain.Events;
 using CloudFabric.EventSourcing.Tests.Domain.ValueObjects;
 
-#pragma warning disable CS8618
-
 namespace CloudFabric.EventSourcing.Tests.Domain;
 
 public class Order : AggregateBase
@@ -15,21 +13,22 @@ public class Order : AggregateBase
     }
 
     public Order(Guid id, string orderName, List<OrderItem> items, Guid createdById, string createdByEmail)
+        : base(id)
     {
         Apply(new OrderPlaced(id, orderName, PartitionKey, items, createdById, createdByEmail));
     }
 
     public override string PartitionKey => PartitionKeys.GetOrderPartitionKey();
 
-    public string OrderName { get; private set; }
-    
+    public string OrderName { get; private set; } = string.Empty;
+
     /// <summary>
     /// It should not be possible to modify the collection from outside.
     /// The only way to modify the collection is by calling aggregate methods AddItem and RemoveItem.
     /// </summary>
-    public ReadOnlyCollection<OrderItem> Items { get; private set; }
+    public ReadOnlyCollection<OrderItem> Items { get; private set; } = new ReadOnlyCollection<OrderItem>(Array.Empty<OrderItem>());
     public Guid CreatedById { get; private set; }
-    public DateTime UpdatedAt { get; set; }
+    public DateTime UpdatedAt { get; private set; }
 
     public void AddItem(OrderItem item)
     {
@@ -50,7 +49,6 @@ public class Order : AggregateBase
 
     public void On(OrderPlaced @event)
     {
-        Id = @event.AggregateId;
         OrderName = @event.OrderName;
         Items = new ReadOnlyCollection<OrderItem>(@event.Items);
         CreatedById = @event.CreatedById;

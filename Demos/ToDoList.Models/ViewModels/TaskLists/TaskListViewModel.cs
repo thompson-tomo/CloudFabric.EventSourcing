@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+
 namespace ToDoList.Models.ViewModels.TaskLists;
 
 public class TaskListViewModel
@@ -9,4 +11,5 @@ public class TaskListViewModel
     public int TasksCount { get; set; }
     public int OpenTasksCount { get; set; }
     public int ClosedTasksCount { get; set; }
+    public List<TaskListShareViewModel> SharedUsers { get; set; } = new();
 }

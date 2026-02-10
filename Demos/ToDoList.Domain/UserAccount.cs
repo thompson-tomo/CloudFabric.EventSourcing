@@ -20,6 +20,7 @@ public class UserAccount : AggregateBase
     }
 
     public UserAccount(Guid id, string firstName, string hashedPassword)
+        : base(id)
     {
         Apply(new UserAccountRegistered(id, firstName, hashedPassword));
     }
@@ -33,7 +34,6 @@ public class UserAccount : AggregateBase
 
     public void On(UserAccountRegistered @event)
     {
-        Id = @event.Id;
         FirstName = @event.FirstName;
         HashedPassword = @event.HashedPassword;
     }

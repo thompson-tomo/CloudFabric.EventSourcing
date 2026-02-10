@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using CloudFabric.EventSourcing.Domain;
 using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.EventStore.Persistence;
@@ -166,7 +165,7 @@ public abstract class OrderTests : TestsBaseWithProjections<OrderListProjectionI
         await Task.Delay(ProjectionsUpdateDelay);
 
         var orderProjection = await ProjectionsRepository.Single(id, PartitionKeys.GetOrderPartitionKey());
-        Debug.Assert(orderProjection != null, nameof(orderProjection) + " != null");
+        orderProjection.Should().NotBeNull();
 
         orderProjection.Name.Should().Be(orderName);
         orderProjection.ItemsCount.Should().Be(items.Count);
@@ -195,7 +194,7 @@ public abstract class OrderTests : TestsBaseWithProjections<OrderListProjectionI
         order2.Items.Count.Should().Be(7);
 
         var orderProjection2 = await ProjectionsRepository.Single(id, PartitionKeys.GetOrderPartitionKey());
-        Debug.Assert(orderProjection2 != null, nameof(orderProjection2) + " != null");
+        orderProjection2.Should().NotBeNull();
 
         orderProjection2.Name.Should().Be(orderName);
         orderProjection2.ItemsCount.Should().Be(7);

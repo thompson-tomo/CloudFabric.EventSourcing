@@ -8,6 +8,15 @@ public interface ITaskListsService
 {
     Task<ServiceResult<TaskViewModel>> CreateTask(CreateTaskRequest request, CancellationToken cancellationToken);
     Task<ServiceResult<TaskViewModel>> UpdateTaskPosition(UpdateTaskPositionRequest request, CancellationToken cancellationToken);
+    Task<ServiceResult<TaskViewModel>> AddSubTask(AddSubTaskRequest request, CancellationToken cancellationToken);
+    Task<ServiceResult<TaskViewModel>> UpdateSubTaskTitle(UpdateSubTaskTitleRequest request, CancellationToken cancellationToken);
+    Task<ServiceResult<TaskViewModel>> UpdateSubTaskPosition(UpdateSubTaskPositionRequest request, CancellationToken cancellationToken);
+    Task<ServiceResult<TaskViewModel>> ToggleSubTaskCompletion(ToggleSubTaskCompletionRequest request, CancellationToken cancellationToken);
+    Task<ServiceResult<TaskViewModel>> RemoveSubTask(RemoveSubTaskRequest request, CancellationToken cancellationToken);
+    Task<ServiceResult<TaskViewModel>> AddTaskAttachment(AddTaskAttachmentRequest request, CancellationToken cancellationToken);
+    Task<ServiceResult<TaskViewModel>> RemoveTaskAttachment(RemoveTaskAttachmentRequest request, CancellationToken cancellationToken);
+    Task<ServiceResult<TaskViewModel>> UpdateTaskDueDate(UpdateTaskDueDateRequest request, CancellationToken cancellationToken);
+    Task<ServiceResult<TaskViewModel>> UpdateTaskReminder(UpdateTaskReminderRequest request, CancellationToken cancellationToken);
     
     Task<ServiceResult<TaskListWithTasksViewModel>> CreateTaskList(CreateTaskListRequest request, CancellationToken cancellationToken);
     Task<ServiceResult<TaskListViewModel>> GetTaskListById(Guid taskListId, CancellationToken cancellationToken);
@@ -39,4 +48,6 @@ public interface ITaskListsService
         CancellationToken cancellationToken);
     
     Task<ServiceResult<TaskListViewModel>> UpdateTaskListName(Guid taskListId, UpdateTaskListNameRequest request, CancellationToken cancellationToken);
+    Task<ServiceResult<TaskListViewModel>> ShareTaskList(ShareTaskListRequest request, CancellationToken cancellationToken);
+    Task<ServiceResult<TaskListViewModel>> RevokeTaskListShare(RevokeTaskListShareRequest request, CancellationToken cancellationToken);
 }

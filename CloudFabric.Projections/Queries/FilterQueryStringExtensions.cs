@@ -44,7 +44,9 @@ public static class FilterQueryStringExtensions
 
         if (filter.Value != null)
         {
-            valueSerialized = filter.Value.ToString();
+            valueSerialized = filter.Value is DateTime dt
+                ? dt.ToString("O", System.Globalization.CultureInfo.InvariantCulture)
+                : filter.Value.ToString();
 
             if (FacetValuesShortcuts.ContainsKey(valueSerialized))
             {
@@ -150,9 +152,9 @@ public static class FilterQueryStringExtensions
             Filters = filters
         };
 
-        if (value.IndexOf("'", StringComparison.Ordinal) == 0)
+        if (value.Length >= 2 && value[0] == '\'' && value[^1] == '\'')
         {
-            filter.Value = value.Replace("'", "");
+            filter.Value = value[1..^1];
         }
         else
         {
@@ -162,19 +164,17 @@ public static class FilterQueryStringExtensions
             }
             else if (Int64.TryParse(value, out var longValue))
             {
+                // Always parse as Int64 — serialization loses type info,
+                // and projection stores typically use long for integers.
                 filter.Value = longValue;
             }
-            else if (Int32.TryParse(value, out var intValue))
-            {
-                filter.Value = intValue;
-            }
-            else if (decimal.TryParse(value, out var decimalValue))
+            else if (decimal.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, out var decimalValue))
             {
                 filter.Value = decimalValue;
             }
-            else if (DateTime.TryParse(value, out var dateTimeValue))
+            else if (DateTime.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AdjustToUniversal, out var dateTimeValue))
             {
-                filter.Value = DateTime.SpecifyKind(dateTimeValue, DateTimeKind.Utc);
+                filter.Value = dateTimeValue;
             }
             // Important: Guids may be stored via two ways: as simple strings or as Guid objects.
             // If we are here - that means guid was passed as an object, not as a string (see first `if` above).

@@ -109,6 +109,7 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
     private readonly ElasticClient _client;
     private readonly ElasticSearchIndexer _indexer;
     private readonly ILogger<ElasticSearchProjectionRepository> _logger;
+    private readonly Task _clusterSettingsTask;
 
     /// <summary>
     /// When request streaming is disabled, elastic adds debug information about request and response to response object which can
@@ -149,10 +150,11 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
             .DefaultFieldNameInferrer(x => x);
 
         _client = new ElasticClient(connectionSettings);
-        
+
         // Very important setting - when we remove the index, system has to create it explicitly, with all custom analyzers and settings.
-        // Otherwise the index won't have proper attributes and just won't work
-        _client.Cluster.PutSettingsAsync(settings => settings.Persistent(p => { 
+        // Otherwise the index won't have proper attributes and just won't work.
+        // Stored as Task and awaited in CreateIndex to ensure settings are applied before index creation.
+        _clusterSettingsTask = _client.Cluster.PutSettingsAsync(settings => settings.Persistent(p => {
             p["action.auto_create_index"] = "false";
             return p;
         }));
@@ -191,15 +193,15 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
             .DefaultFieldNameInferrer(x => x);
 
         _client = new ElasticClient(connectionSettings);
-        
+
         // Very important setting - when we remove the index, system has to create it explicitly, with all custom analyzers and settings.
-        // Otherwise the index won't have proper attributes and just won't work
-        _client.Cluster.PutSettingsAsync(settings => settings.Persistent(p => { 
+        // Otherwise the index won't have proper attributes and just won't work.
+        // Stored as Task and awaited in CreateIndex to ensure settings are applied before index creation.
+        _clusterSettingsTask = _client.Cluster.PutSettingsAsync(settings => settings.Persistent(p => {
             p["action.auto_create_index"] = "false";
             return p;
         }));
 
-        // create an index
         _indexer = new ElasticSearchIndexer(basicAuthConnectionSettings, loggerFactory);
     }
 
@@ -218,6 +220,7 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
   
     protected override async Task CreateIndex(string indexName, ProjectionDocumentSchema projectionDocumentSchema)
     {
+        await _clusterSettingsTask;
         await _indexer.CreateOrUpdateIndex(indexName, projectionDocumentSchema);
     }
 

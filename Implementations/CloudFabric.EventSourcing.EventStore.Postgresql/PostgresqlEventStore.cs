@@ -226,8 +226,8 @@ public class PostgresqlEventStore : IEventStore
                         Version = reader.GetInt16("stream_version")
                     },
                     EventType = reader.GetString("event_type"),
-                    EventData = JsonDocument.Parse(reader.GetString("event_data")).RootElement,
-                    UserInfo = JsonDocument.Parse(reader.GetString("user_info")).RootElement,
+                    EventData = JsonSerializer.Deserialize<JsonElement>(reader.GetString("event_data")),
+                    UserInfo = JsonSerializer.Deserialize<JsonElement>(reader.GetString("user_info")),
                 };
 
                 version = eventWrapper.StreamInfo.Version;
@@ -253,90 +253,28 @@ public class PostgresqlEventStore : IEventStore
     public async Task<EventStream> LoadStreamAsync(Guid streamId, string partitionKey, int fromVersion, CancellationToken cancellationToken = default)
     {
         var connectionInformation = ConnectionInformation;
-        
+
         await using var conn = new NpgsqlConnection(connectionInformation.ConnectionString);
         await conn.OpenAsync(cancellationToken);
 
         await using var cmd = new NpgsqlCommand(
-            $"SELECT id, stream_id, stream_version, event_type, event_data, user_info, eventstore_schema_version " +
+            $"SELECT id, stream_id, stream_version, event_type, event_data, user_info " +
             $"FROM \"{connectionInformation.TableName}\" " +
             $"WHERE stream_id = @streamId AND partition_key = @partitionKey AND stream_version >= @fromVersion ORDER BY stream_version ASC", conn)
         {
             Parameters =
             {
                 new("streamId", streamId),
-                new("partitionKey", partitionKey)
+                new("partitionKey", partitionKey),
+                new("fromVersion", fromVersion)
             }
         };
-
-        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
-
-        var version = 0;
-        var events = new List<IEvent>();
-
-        while (await reader.ReadAsync(cancellationToken))
-        {
-            var streamInfo = JsonSerializer.Deserialize<StreamInfo>(reader.GetString(1), EventStoreSerializerOptions.Options);
-
-            if(streamInfo == null) {
-                throw new Exception("Failed to deserialize stream info");
-            }
-
-            var eventWrapper = new EventWrapper()
-            {
-                Id = reader.GetGuid(0),
-                StreamInfo = streamInfo
-            };
-
-            version = eventWrapper.StreamInfo.Version;
-
-            events.Add(eventWrapper.GetEvent());
-        }
-
-        return new EventStream(streamId, version, events);
-    }
-
-    public async Task<List<IEvent>> LoadEventsAsync(
-        string? partitionKey, 
-        DateTime? dateFrom = null, 
-        int limit = 250, 
-        CancellationToken cancellationToken = default
-    ) {
-        var connectionInformation = ConnectionInformation;
-        
-        await using var conn = new NpgsqlConnection(connectionInformation.ConnectionString);
-        await conn.OpenAsync(cancellationToken);
-
-        List<string> wheres = new List<string>();
-        List<NpgsqlParameter> parameters = new List<NpgsqlParameter>();
-
-        if (!string.IsNullOrEmpty(partitionKey))
-        {
-            wheres.Add($"partition_key = @partitionKey");
-            parameters.Add(new("partitionKey", partitionKey));
-        }
-
-        if (dateFrom.HasValue)
-        {
-            wheres.Add($"created_at > @createdAt");
-            parameters.Add(new("createdAt", dateFrom));
-        }
-
-        await using var cmd = new NpgsqlCommand(
-            $"SELECT id, event_type, event_data " +
-            $"FROM \"{connectionInformation.TableName}\" " +
-            (wheres.Count > 0
-                ? $"WHERE {string.Join(" AND ", wheres)} "
-                : "") +
-            $"ORDER BY created_at ASC " +
-            $"LIMIT {limit}", conn
-        );
-        
-        cmd.Parameters.AddRange(parameters.ToArray());
 
         try
         {
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+            var version = 0;
             var events = new List<IEvent>();
 
             while (await reader.ReadAsync(cancellationToken))
@@ -344,14 +282,22 @@ public class PostgresqlEventStore : IEventStore
                 var eventWrapper = new EventWrapper()
                 {
                     Id = reader.GetGuid("id"),
+                    StreamInfo = new StreamInfo
+                    {
+                        Id = reader.GetGuid("stream_id"),
+                        Version = reader.GetInt16("stream_version")
+                    },
                     EventType = reader.GetString("event_type"),
-                    EventData = JsonDocument.Parse(reader.GetString("event_data")).RootElement
+                    EventData = JsonSerializer.Deserialize<JsonElement>(reader.GetString("event_data")),
+                    UserInfo = JsonSerializer.Deserialize<JsonElement>(reader.GetString("user_info")),
                 };
+
+                version = eventWrapper.StreamInfo.Version;
 
                 events.Add(eventWrapper.GetEvent());
             }
 
-            return events;
+            return new EventStream(streamId, version, events);
         }
         catch (NpgsqlException ex)
         {
@@ -366,6 +312,116 @@ public class PostgresqlEventStore : IEventStore
         }
     }
 
+    public async Task<LoadEventsResult> LoadEventsAsync(
+        string? partitionKey,
+        DateTime? dateFrom = null,
+        int limit = 250,
+        string? continuationToken = null,
+        CancellationToken cancellationToken = default
+    ) {
+        var connectionInformation = ConnectionInformation;
+
+        await using var conn = new NpgsqlConnection(connectionInformation.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        List<string> wheres = new List<string>();
+        List<NpgsqlParameter> parameters = new List<NpgsqlParameter>();
+
+        if (!string.IsNullOrEmpty(partitionKey))
+        {
+            wheres.Add("partition_key = @partitionKey");
+            parameters.Add(new("partitionKey", partitionKey));
+        }
+
+        // Keyset pagination: use (created_at, id) composite cursor from continuation token
+        if (!string.IsNullOrEmpty(continuationToken) && TryParseContinuationToken(continuationToken, out var cursorDate, out var cursorId))
+        {
+            wheres.Add("(created_at, id) > (@cursorDate, @cursorId)");
+            parameters.Add(new("cursorDate", cursorDate));
+            parameters.Add(new("cursorId", cursorId));
+        }
+        else if (dateFrom.HasValue)
+        {
+            wheres.Add("created_at >= @createdAt");
+            parameters.Add(new("createdAt", dateFrom));
+        }
+
+        await using var cmd = new NpgsqlCommand(
+            $"SELECT id, created_at, event_type, event_data " +
+            $"FROM \"{connectionInformation.TableName}\" " +
+            (wheres.Count > 0
+                ? $"WHERE {string.Join(" AND ", wheres)} "
+                : "") +
+            $"ORDER BY created_at ASC, id ASC " +
+            $"LIMIT {limit}", conn
+        );
+
+        cmd.Parameters.AddRange(parameters.ToArray());
+
+        try
+        {
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            var events = new List<IEvent>();
+            Guid lastId = Guid.Empty;
+            DateTime lastCreatedAt = DateTime.MinValue;
+
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                lastId = reader.GetGuid("id");
+                lastCreatedAt = reader.GetDateTime("created_at");
+
+                var eventWrapper = new EventWrapper()
+                {
+                    Id = lastId,
+                    EventType = reader.GetString("event_type"),
+                    EventData = JsonSerializer.Deserialize<JsonElement>(reader.GetString("event_data"))
+                };
+
+                events.Add(eventWrapper.GetEvent());
+            }
+
+            return new LoadEventsResult
+            {
+                Events = events,
+                ContinuationToken = events.Count > 0
+                    ? BuildContinuationToken(lastCreatedAt, lastId)
+                    : null
+            };
+        }
+        catch (NpgsqlException ex)
+        {
+            if (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+            {
+                throw new Exception(
+                    "EventStore table not found, please make sure to call Initialize() on event store first.",
+                    ex);
+            }
+
+            throw;
+        }
+    }
+
+    private static string BuildContinuationToken(DateTime createdAt, Guid id)
+    {
+        return $"{createdAt:O}|{id}";
+    }
+
+    private static bool TryParseContinuationToken(string token, out DateTime createdAt, out Guid id)
+    {
+        createdAt = default;
+        id = default;
+
+        var parts = token.Split('|', 2);
+        if (parts.Length != 2)
+        {
+            return false;
+        }
+
+        return DateTime.TryParse(parts[0], System.Globalization.CultureInfo.InvariantCulture,
+                   System.Globalization.DateTimeStyles.RoundtripKind, out createdAt)
+               && Guid.TryParse(parts[1], out id);
+    }
+
     public async Task<bool> AppendToStreamAsync(EventUserInfo eventUserInfo, Guid streamId, int expectedVersion, IEnumerable<IEvent> events, CancellationToken cancellationToken = default)
     {
         if (streamId == Guid.Empty)
@@ -373,9 +429,11 @@ public class PostgresqlEventStore : IEventStore
             throw new ArgumentNullException($"{nameof(streamId)} cannot be an empty Guid");
         }
 
+        var eventsList = events as IList<IEvent> ?? events.ToList();
+
         var connectionInformation = ConnectionInformation;
 
-        if (events.GroupBy(x => x.PartitionKey).Count() != 1)
+        if (eventsList.GroupBy(x => x.PartitionKey).Count() != 1)
         {
             throw new ArgumentException("Partition keys for all events in the stream must be the same");
         }
@@ -400,12 +458,7 @@ public class PostgresqlEventStore : IEventStore
 
             if (version != null && version is not DBNull && (int)version != expectedVersion)
             {
-                if(expectedVersion == 0) {
-                    throw new Exception("Expected event stream to be empty but it already exists.");
-                }
-
-                throw new Exception("Event stream has new event which were not expected. " +
-                                    "This usually means that another thread/process appended events to the stream between read and write operations.");
+                return false;
             }
         }
         catch (NpgsqlException ex)
@@ -420,9 +473,9 @@ public class PostgresqlEventStore : IEventStore
             throw;
         }
 
-        await using var batchInsert = new NpgsqlBatch(conn);
+        await using var batchInsert = new NpgsqlBatch(conn, transaction);
 
-        foreach (var evt in events)
+        foreach (var evt in eventsList)
         {
             batchInsert.BatchCommands.Add(new NpgsqlBatchCommand($"" +
                 $"INSERT INTO \"{connectionInformation.TableName}\" " +
@@ -455,13 +508,20 @@ public class PostgresqlEventStore : IEventStore
             });
         }
 
-        await batchInsert.ExecuteNonQueryAsync(cancellationToken);
-
-        await transaction.CommitAsync(cancellationToken);
-
-        foreach (var e in events)
+        try
         {
-            foreach (var h in _eventAddedEventHandlers)
+            await batchInsert.ExecuteNonQueryAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
+        {
+            return false;
+        }
+
+        var handlers = _eventAddedEventHandlers.ToList();
+        foreach (var e in eventsList)
+        {
+            foreach (var h in handlers)
             {
                 await h(e);
             }
@@ -516,7 +576,8 @@ public class PostgresqlEventStore : IEventStore
                     $"  event_type varchar(500), " +
                     $"  event_data jsonb, " +
                     $"  user_info jsonb, " +
-                    $"  eventstore_schema_version int NOT NULL" +
+                    $"  eventstore_schema_version int NOT NULL, " +
+                    $"  UNIQUE (stream_id, partition_key, stream_version)" +
                     $");" +
                     $"CREATE INDEX \"{connectionInformation.TableName}_stream_id_idx\" " +
                     $"  ON \"{connectionInformation.TableName}\" (stream_id);" +
@@ -559,22 +620,8 @@ public class PostgresqlEventStore : IEventStore
         }
     }
 
-    #region Snapshot Functionality
-
-    // private async Task<TSnapshot> LoadSnapshotAsync<TSnapshot>(string streamId)
-    // {
-    //     Container container = _client.GetContainer(_databaseName, _tableName);
-    //
-    //     PartitionKey partitionKey = new PartitionKey(streamId);
-    //
-    //     var response = await container.ReadItemAsync<TSnapshot>(streamId, partitionKey);
-    //     if (response.StatusCode == HttpStatusCode.OK)
-    //     {
-    //         return response.Resource;
-    //     }
-    //
-    //     return default(TSnapshot);
-    // }
-
-    #endregion
+    public ValueTask DisposeAsync()
+    {
+        return ValueTask.CompletedTask;
+    }
 }

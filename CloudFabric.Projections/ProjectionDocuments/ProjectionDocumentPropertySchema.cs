@@ -48,4 +48,26 @@ public class ProjectionDocumentPropertySchema
     {
         return $"ProjectionDocumentPropertySchema:{PropertyName}: {PropertyType}";
     }
+
+    public ProjectionDocumentPropertySchema Clone()
+    {
+        var clone = (ProjectionDocumentPropertySchema)MemberwiseClone();
+
+        if (SynonymMaps != null)
+        {
+            clone.SynonymMaps = (string[])SynonymMaps.Clone();
+        }
+
+        if (FacetableRanges != null)
+        {
+            clone.FacetableRanges = (double[])FacetableRanges.Clone();
+        }
+
+        if (NestedObjectProperties != null)
+        {
+            clone.NestedObjectProperties = NestedObjectProperties.Select(p => p.Clone()).ToList();
+        }
+
+        return clone;
+    }
 }

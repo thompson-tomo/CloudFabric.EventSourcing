@@ -1,10 +1,11 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 
 namespace CloudFabric.Projections;
 
 public abstract class ProjectionRepositoryFactory
 {
-    protected readonly Dictionary<string, object> _repositories = new Dictionary<string, object>();
+    protected readonly ConcurrentDictionary<string, object> _repositories = new();
 
     protected readonly ILoggerFactory _loggerFactory;
 
@@ -16,10 +17,10 @@ public abstract class ProjectionRepositoryFactory
     protected IProjectionRepository<TProjectionDocument>? GetFromCache<TProjectionDocument>() where TProjectionDocument : ProjectionDocument
     {
         var name = typeof(TProjectionDocument).FullName!;
-        
-        if (_repositories.ContainsKey(name))
+
+        if (_repositories.TryGetValue(name, out var cached))
         {
-            return (IProjectionRepository<TProjectionDocument>)_repositories[name];
+            return (IProjectionRepository<TProjectionDocument>)cached;
         }
 
         return null;
@@ -31,19 +32,14 @@ public abstract class ProjectionRepositoryFactory
 
         _repositories[name] = repository;
     }
-    
+
     protected virtual ProjectionRepository? GetFromCache(ProjectionDocumentSchema? schema)
     {
-        var name = "empty-schema";
-        
-        if (schema != null)
-        {
-            name = $"{schema.SchemaName}_{ProjectionDocumentSchemaFactory.GetPropertiesUniqueHash(schema.Properties)}";
-        }
+        var name = GetSchemaKey(schema);
 
-        if (_repositories.ContainsKey(name))
+        if (_repositories.TryGetValue(name, out var cached))
         {
-            return (ProjectionRepository)_repositories[name];
+            return (ProjectionRepository)cached;
         }
 
         return null;
@@ -51,16 +47,21 @@ public abstract class ProjectionRepositoryFactory
 
     protected virtual void SetToCache(ProjectionDocumentSchema? schema, ProjectionRepository repository)
     {
-        var name = "empty-schema";
-        
-        if (schema != null)
-        {
-            name = $"{schema.SchemaName}_{ProjectionDocumentSchemaFactory.GetPropertiesUniqueHash(schema.Properties)}";
-        }
+        var name = GetSchemaKey(schema);
 
         _repositories[name] = repository;
     }
-    
+
+    private static string GetSchemaKey(ProjectionDocumentSchema? schema)
+    {
+        if (schema == null)
+        {
+            return "empty-schema";
+        }
+
+        return $"{schema.SchemaName}_{ProjectionDocumentSchemaFactory.GetPropertiesUniqueHash(schema.Properties)}";
+    }
+
     public abstract IProjectionRepository<TProjectionDocument> GetProjectionRepository<TProjectionDocument>()
         where TProjectionDocument : ProjectionDocument;
 

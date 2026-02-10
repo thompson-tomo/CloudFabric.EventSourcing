@@ -129,7 +129,8 @@ public class CosmosDbProjectionRepository : ProjectionRepository
 
     protected override Task CreateIndex(string indexName, ProjectionDocumentSchema projectionDocumentSchema)
     {
-        throw new NotImplementedException();
+        // CosmosDb manages indexes automatically — no explicit index creation needed
+        return Task.CompletedTask;
     }
 
     public override async Task<Dictionary<string, object?>?> Single(
@@ -391,7 +392,6 @@ public class CosmosDbProjectionRepository : ProjectionRepository
 
     private (string, CosmosDbSqlParameter?) ConstructOneConditionFilter(Filter filter)
     {
-        var filterOperator = "";
         var propertyName = filter.PropertyName;
 
         if (string.IsNullOrEmpty(propertyName))
@@ -399,29 +399,39 @@ public class CosmosDbProjectionRepository : ProjectionRepository
             return (string.Empty, null);
         }
 
+        var param = new CosmosDbSqlParameter(propertyName, filter.Value);
+
         switch (filter.Operator)
         {
             case FilterOperator.Equal:
-                filterOperator = "=";
-                break;
-            case FilterOperator.Greater:
-                filterOperator = ">";
-                break;
-            case FilterOperator.GreaterOrEqual:
-                filterOperator = ">=";
-                break;
-            case FilterOperator.Lower:
-                filterOperator = "<";
-                break;
-            case FilterOperator.LowerOrEqual:
-                filterOperator = "<=";
-                break;
+                return ($"t.{propertyName} = @{propertyName}", param);
             case FilterOperator.NotEqual:
-                filterOperator = "!=";
-                break;
+                return ($"t.{propertyName} != @{propertyName}", param);
+            case FilterOperator.Greater:
+                return ($"t.{propertyName} > @{propertyName}", param);
+            case FilterOperator.GreaterOrEqual:
+                return ($"t.{propertyName} >= @{propertyName}", param);
+            case FilterOperator.Lower:
+                return ($"t.{propertyName} < @{propertyName}", param);
+            case FilterOperator.LowerOrEqual:
+                return ($"t.{propertyName} <= @{propertyName}", param);
+            case FilterOperator.StartsWith:
+                return ($"STARTSWITH(t.{propertyName}, @{propertyName})", param);
+            case FilterOperator.EndsWith:
+                return ($"ENDSWITH(t.{propertyName}, @{propertyName})", param);
+            case FilterOperator.Contains:
+                return ($"CONTAINS(t.{propertyName}, @{propertyName})", param);
+            case FilterOperator.StartsWithIgnoreCase:
+                return ($"STARTSWITH(t.{propertyName}, @{propertyName}, true)", param);
+            case FilterOperator.EndsWithIgnoreCase:
+                return ($"ENDSWITH(t.{propertyName}, @{propertyName}, true)", param);
+            case FilterOperator.ContainsIgnoreCase:
+                return ($"CONTAINS(t.{propertyName}, @{propertyName}, true)", param);
+            case FilterOperator.ArrayContains:
+                return ($"ARRAY_CONTAINS(t.{propertyName}, @{propertyName})", param);
+            default:
+                return ($"t.{propertyName} = @{propertyName}", param);
         }
-
-        return ($"t.{propertyName} {filterOperator} @{propertyName}", new CosmosDbSqlParameter(propertyName, filter.Value));
     }
 
     private (string, List<CosmosDbSqlParameter>) ConstructConditionFilter(Filter filter)
@@ -449,7 +459,9 @@ public class CosmosDbProjectionRepository : ProjectionRepository
                 q += "(";
             }
 
-            q += ConstructConditionFilter(f.Filter);
+            var (filterClause, filterParams) = ConstructConditionFilter(f.Filter);
+            q += filterClause;
+            parameters.AddRange(filterParams);
 
             if (wrapWithParentheses)
             {
@@ -501,20 +513,25 @@ public class CosmosDbProjectionRepository : ProjectionRepository
                     exception.StatusCode == HttpStatusCode.TooManyRequests ||
                     exception.StatusCode == HttpStatusCode.RequestTimeout
             )
-            .RetryForeverAsync(
-                exception =>
+            .WaitAndRetryAsync(
+                retryCount: 10,
+                sleepDurationProvider: (retryAttempt, exception, context) =>
+                {
+                    var cosmosException = (CosmosException)exception;
+                    return cosmosException.RetryAfter ?? TimeSpan.FromMilliseconds(100 * Math.Pow(2, retryAttempt));
+                },
+                onRetryAsync: (exception, timeSpan, retryAttempt, context) =>
                 {
                     var cosmosException = (CosmosException)exception;
 
-                    var retryAfter = cosmosException.RetryAfter ?? TimeSpan.FromMilliseconds(100);
-
                     _logger.LogDebug(
-                        "{reason} - sleeping for {delay}",
-                        cosmosException.StatusCode == HttpStatusCode.RequestTimeout ? "Timeout" : "Rate limitting",
-                        retryAfter
+                        "{reason} - retry {RetryAttempt}, sleeping for {delay}",
+                        cosmosException.StatusCode == HttpStatusCode.RequestTimeout ? "Timeout" : "Rate limiting",
+                        retryAttempt,
+                        timeSpan
                     );
 
-                    return Task.Delay(retryAfter, cancellationToken);
+                    return Task.CompletedTask;
                 }
             )
             .ExecuteAsync(function, cancellationToken);

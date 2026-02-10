@@ -1,20 +1,17 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using CloudFabric.EventSourcing.EventStore.Persistence;
 
 namespace CloudFabric.EventSourcing.EventStore.InMemory;
 
-public class EventAddedEventArgs : EventArgs
-{
-    public IEvent Event { get; set; }
-}
-
 public class InMemoryEventStore : IEventStore
 {
-    private readonly Dictionary<(Guid StreamId, string PartitionKey), List<string>> _eventsContainer;
+    private readonly ConcurrentDictionary<(Guid StreamId, string PartitionKey), List<string>> _eventsContainer;
+    private readonly object _lock = new();
     private readonly List<Func<IEvent, Task>> _eventAddedEventHandlers = new();
 
     public InMemoryEventStore(
-        Dictionary<(Guid StreamId, string PartitionKey), List<string>> eventsContainer
+        ConcurrentDictionary<(Guid StreamId, string PartitionKey), List<string>> eventsContainer
     )
     {
         _eventsContainer = eventsContainer;
@@ -27,132 +24,188 @@ public class InMemoryEventStore : IEventStore
 
     public void SubscribeToEventAdded(Func<IEvent, Task> handler)
     {
-        _eventAddedEventHandlers.Add(handler);
+        lock (_lock)
+        {
+            _eventAddedEventHandlers.Add(handler);
+        }
     }
 
     public void UnsubscribeFromEventAdded(Func<IEvent, Task> handler)
     {
-        _eventAddedEventHandlers.Remove(handler);
+        lock (_lock)
+        {
+            _eventAddedEventHandlers.Remove(handler);
+        }
     }
 
-    
-    public async Task<EventStoreStatistics> GetStatistics(CancellationToken cancellationToken = default)
+    public Task<EventStoreStatistics> GetStatistics(CancellationToken cancellationToken = default)
     {
         var stats = new EventStoreStatistics();
-        
-        stats.TotalEventsCount = _eventsContainer.Count;
 
-        var eventsOrderedByTimestamp = _eventsContainer
-            .SelectMany(x => x.Value)
-            .Select(x => JsonSerializer.Deserialize<EventWrapper>(x, EventStoreSerializerOptions.Options).GetEvent())
-            .OrderBy(x => x.Timestamp)
-            .ToList();
+        DateTime? firstTimestamp = null;
+        DateTime? lastTimestamp = null;
+        long totalCount = 0;
 
-        if (eventsOrderedByTimestamp.Count > 0)
+        foreach (var kvp in _eventsContainer)
         {
-            stats.FirstEventCreatedAt = eventsOrderedByTimestamp.First().Timestamp;
-        }
-        if (eventsOrderedByTimestamp.Count > 0)
-        {
-            stats.LastEventCreatedAt = eventsOrderedByTimestamp.Last().Timestamp;
+            List<string> snapshot;
+            lock (_lock)
+            {
+                snapshot = kvp.Value.ToList();
+            }
+
+            totalCount += snapshot.Count;
+
+            foreach (var data in snapshot)
+            {
+                var wrapper = JsonSerializer.Deserialize<EventWrapper>(data, EventStoreSerializerOptions.Options);
+                if (wrapper == null) continue;
+
+                var evt = wrapper.GetEvent();
+                if (firstTimestamp == null || evt.Timestamp < firstTimestamp)
+                {
+                    firstTimestamp = evt.Timestamp;
+                }
+                if (lastTimestamp == null || evt.Timestamp > lastTimestamp)
+                {
+                    lastTimestamp = evt.Timestamp;
+                }
+            }
         }
 
-        return stats;
+        stats.TotalEventsCount = totalCount;
+        if (firstTimestamp.HasValue) stats.FirstEventCreatedAt = firstTimestamp.Value;
+        if (lastTimestamp.HasValue) stats.LastEventCreatedAt = lastTimestamp.Value;
+
+        return Task.FromResult(stats);
     }
-    
+
     public Task DeleteAll(CancellationToken cancellationToken = default)
     {
         _eventsContainer.Clear();
         return Task.CompletedTask;
     }
 
-    public async Task<bool> HardDeleteAsync(Guid streamId, string partitionKey, CancellationToken cancellationToken = default)
+    public Task<bool> HardDeleteAsync(Guid streamId, string partitionKey, CancellationToken cancellationToken = default)
     {
-        return _eventsContainer.Remove((streamId, partitionKey));
+        var result = _eventsContainer.TryRemove((streamId, partitionKey), out _);
+        return Task.FromResult(result);
     }
 
-    public async Task<EventStream> LoadStreamAsyncOrThrowNotFound(Guid streamId, string partitionKey, CancellationToken cancellationToken = default)
+    public Task<EventStream> LoadStreamAsyncOrThrowNotFound(Guid streamId, string partitionKey, CancellationToken cancellationToken = default)
     {
-        var eventWrappers = await LoadOrderedEventWrappers(streamId, partitionKey);
+        var eventWrappers = LoadOrderedEventWrappers(streamId, partitionKey);
         if (eventWrappers.Count == 0)
         {
             throw new NotFoundException();
         }
 
         int version = eventWrappers.Max(x => x.StreamInfo.Version);
-        var events = new List<IEvent>();
-        foreach (var wrapper in eventWrappers)
-        {
-            events.Add(wrapper.GetEvent());
-        }
+        var events = eventWrappers.Select(w => w.GetEvent()).ToList();
 
-        return new EventStream(streamId, version, events);
+        return Task.FromResult(new EventStream(streamId, version, events));
     }
 
-    public async Task<EventStream> LoadStreamAsync(Guid streamId, string partitionKey, CancellationToken cancellationToken = default)
+    public Task<EventStream> LoadStreamAsync(Guid streamId, string partitionKey, CancellationToken cancellationToken = default)
     {
-        var eventWrappers = await LoadOrderedEventWrappers(streamId, partitionKey);
+        var eventWrappers = LoadOrderedEventWrappers(streamId, partitionKey);
 
         int version = eventWrappers.Count > 0
             ? eventWrappers.Max(x => x.StreamInfo.Version)
             : 0;
-        var events = new List<IEvent>();
-        foreach (var wrapper in eventWrappers)
-        {
-            events.Add(wrapper.GetEvent());
-        }
+        var events = eventWrappers.Select(w => w.GetEvent()).ToList();
 
-        return new EventStream(streamId, version, events);
+        return Task.FromResult(new EventStream(streamId, version, events));
     }
 
-    public async Task<EventStream> LoadStreamAsync(Guid streamId, string partitionKey, int fromVersion, CancellationToken cancellationToken = default)
+    public Task<EventStream> LoadStreamAsync(Guid streamId, string partitionKey, int fromVersion, CancellationToken cancellationToken = default)
     {
-        var eventWrappers = await LoadOrderedEventWrappersFromVersion(streamId, partitionKey, fromVersion);
+        var eventWrappers = LoadOrderedEventWrappersFromVersion(streamId, partitionKey, fromVersion);
 
-        if (eventWrappers.Count == 0)
-        {
-            throw new NotFoundException();
-        }
+        int version = eventWrappers.Count > 0
+            ? eventWrappers.Max(x => x.StreamInfo.Version)
+            : 0;
+        var events = eventWrappers.Select(w => w.GetEvent()).ToList();
 
-        int version = eventWrappers.Max(x => x.StreamInfo.Version);
-        var events = new List<IEvent>();
-        foreach (var wrapper in eventWrappers)
-        {
-            events.Add(wrapper.GetEvent());
-        }
-
-        return new EventStream(streamId, version, events);
+        return Task.FromResult(new EventStream(streamId, version, events));
     }
 
-    public async Task<List<IEvent>> LoadEventsAsync(
-        string? partitionKey, 
-        DateTime? dateFrom = null, 
-        int limit = 250, 
+    public Task<LoadEventsResult> LoadEventsAsync(
+        string? partitionKey,
+        DateTime? dateFrom = null,
+        int limit = 250,
+        string? continuationToken = null,
         CancellationToken cancellationToken = default)
     {
-        if (_eventsContainer == null || !_eventsContainer.Any())
+        var snapshot = _eventsContainer.ToArray();
+
+        if (snapshot.Length == 0)
         {
-            return new List<IEvent>();
+            return Task.FromResult(new LoadEventsResult());
         }
 
-        var eventsContainer = _eventsContainer;
+        var filtered = !string.IsNullOrEmpty(partitionKey)
+            ? snapshot.Where(x => x.Key.PartitionKey == partitionKey)
+            : snapshot;
 
-        if (!string.IsNullOrEmpty(partitionKey))
-        {
-            eventsContainer = _eventsContainer
-                .Where(x => x.Key.PartitionKey == partitionKey)
-                .ToDictionary(x => x.Key, x => x.Value);
-        }
-
-        var events = eventsContainer
+        // Deserialize all wrappers to get both Id and Event
+        var wrappers = filtered
             .SelectMany(x => x.Value)
-            .Select(x => JsonSerializer.Deserialize<EventWrapper>(x, EventStoreSerializerOptions.Options).GetEvent())
-            .Where(x => !dateFrom.HasValue || x.Timestamp > dateFrom)
-            .OrderBy(x => x.Timestamp)
-            .Take(limit)
-            .ToList();
+            .Select(x => JsonSerializer.Deserialize<EventWrapper>(x, EventStoreSerializerOptions.Options)!)
+            .OrderBy(x => x.GetEvent().Timestamp)
+            .ThenBy(x => x.Id)
+            .AsEnumerable();
 
-        return events;
+        // Apply cursor-based pagination if continuation token is present
+        if (!string.IsNullOrEmpty(continuationToken) && TryParseContinuationToken(continuationToken, out var cursorTimestamp, out var cursorId))
+        {
+            wrappers = wrappers.Where(w =>
+            {
+                var ts = w.GetEvent().Timestamp;
+                return ts > cursorTimestamp || (ts == cursorTimestamp && Comparer<Guid?>.Default.Compare(w.Id, cursorId) > 0);
+            });
+        }
+        else if (dateFrom.HasValue)
+        {
+            wrappers = wrappers.Where(w => w.GetEvent().Timestamp >= dateFrom.Value);
+        }
+
+        var page = wrappers.Take(limit).ToList();
+        var events = page.Select(w => w.GetEvent()).ToList();
+
+        var lastWrapper = page.LastOrDefault();
+        string? nextToken = null;
+        if (lastWrapper != null)
+        {
+            nextToken = BuildContinuationToken(lastWrapper.GetEvent().Timestamp, lastWrapper.Id!.Value);
+        }
+
+        return Task.FromResult(new LoadEventsResult
+        {
+            Events = events,
+            ContinuationToken = nextToken
+        });
+    }
+
+    private static string BuildContinuationToken(DateTime timestamp, Guid id)
+    {
+        return $"{timestamp:O}|{id}";
+    }
+
+    private static bool TryParseContinuationToken(string token, out DateTime timestamp, out Guid id)
+    {
+        timestamp = default;
+        id = default;
+
+        var parts = token.Split('|', 2);
+        if (parts.Length != 2)
+        {
+            return false;
+        }
+
+        return DateTime.TryParse(parts[0], System.Globalization.CultureInfo.InvariantCulture,
+                   System.Globalization.DateTimeStyles.RoundtripKind, out timestamp)
+               && Guid.TryParse(parts[1], out id);
     }
 
     public async Task<bool> AppendToStreamAsync(
@@ -163,47 +216,51 @@ public class InMemoryEventStore : IEventStore
         CancellationToken cancellationToken = default
     )
     {
-        if (events.GroupBy(x => x.PartitionKey).Count() != 1)
+        var eventsList = events as IList<IEvent> ?? events.ToList();
+
+        if (eventsList.GroupBy(x => x.PartitionKey).Count() != 1)
         {
             throw new ArgumentException("Partition keys for all events in the stream must be the same");
         }
 
-        var lockObject = new object();
-        lock (lockObject)
+        var partitionKey = eventsList[0].PartitionKey;
+
+        lock (_lock)
         {
-            var partitionKey = events.First().PartitionKey;
+            _eventsContainer.TryGetValue((streamId, partitionKey), out var currentStream);
+            var currentVersion = 0;
+            if (currentStream != null && currentStream.Count > 0)
+            {
+                currentVersion = currentStream
+                    .Select(s => JsonSerializer.Deserialize<EventWrapper>(s, EventStoreSerializerOptions.Options)!)
+                    .Max(w => w.StreamInfo.Version);
+            }
 
-            // Load stream and verify version hasn't been changed yet.
-            var eventStream = LoadStreamAsync(streamId, partitionKey).GetAwaiter().GetResult();
-
-            if (eventStream.Version != expectedVersion)
+            if (currentVersion != expectedVersion)
             {
                 return false;
             }
 
-            var wrappers = PrepareEvents(eventUserInfo, streamId, expectedVersion, events);
-            var stream = _eventsContainer.ContainsKey((streamId, partitionKey))
-                ? _eventsContainer[(streamId, partitionKey)]
-                : new List<string>();
+            var wrappers = PrepareEvents(eventUserInfo, streamId, expectedVersion, eventsList);
+            var stream = currentStream ?? new List<string>();
 
             foreach (var wrapper in wrappers)
             {
                 stream.Add(JsonSerializer.Serialize(wrapper, EventStoreSerializerOptions.Options));
             }
 
-            if (!_eventsContainer.ContainsKey((streamId, partitionKey)))
-            {
-                _eventsContainer.Add((streamId, partitionKey), stream);
-            }
-            else
-            {
-                _eventsContainer[(streamId, partitionKey)] = stream;
-            }
+            _eventsContainer[(streamId, partitionKey)] = stream;
         }
 
-        foreach (var e in events)
+        List<Func<IEvent, Task>> handlers;
+        lock (_lock)
         {
-            foreach (var h in _eventAddedEventHandlers)
+            handlers = _eventAddedEventHandlers.ToList();
+        }
+
+        foreach (var e in eventsList)
+        {
+            foreach (var h in handlers)
             {
                 await h(e);
             }
@@ -212,64 +269,70 @@ public class InMemoryEventStore : IEventStore
         return true;
     }
 
-    private async Task<List<EventWrapper>> LoadOrderedEventWrappers(Guid streamId, string partitionKey)
+    private List<EventWrapper> LoadOrderedEventWrappers(Guid streamId, string partitionKey)
     {
-        List<string> eventData = _eventsContainer.ContainsKey((streamId, partitionKey))
-            ? _eventsContainer[(streamId, partitionKey)]
-            : new List<string>();
-
-        var eventWrappers = new List<EventWrapper>();
-
-        foreach (var data in eventData)
+        if (!_eventsContainer.TryGetValue((streamId, partitionKey), out var eventData))
         {
-            var eventWrapper = JsonSerializer.Deserialize<EventWrapper>(data, EventStoreSerializerOptions.Options);
-            eventWrappers.Add(eventWrapper);
+            return new List<EventWrapper>();
         }
 
-        eventWrappers = eventWrappers.OrderBy(x => x.StreamInfo.Version).ToList();
-        return eventWrappers;
+        List<string> snapshot;
+        lock (_lock)
+        {
+            snapshot = eventData.ToList();
+        }
+
+        return snapshot
+            .Select(data => JsonSerializer.Deserialize<EventWrapper>(data, EventStoreSerializerOptions.Options)!)
+            .OrderBy(x => x.StreamInfo.Version)
+            .ToList();
     }
 
-    private async Task<List<EventWrapper>> LoadOrderedEventWrappersFromVersion(Guid streamId, string partitionKey, int version)
+    private List<EventWrapper> LoadOrderedEventWrappersFromVersion(Guid streamId, string partitionKey, int version)
     {
-        List<string> eventData =
-            _eventsContainer.ContainsKey((streamId, partitionKey))
-                ? _eventsContainer[(streamId, partitionKey)]
-                : new List<string>();
-        var eventWrappers = new List<EventWrapper>();
-
-        foreach (var data in eventData)
+        if (!_eventsContainer.TryGetValue((streamId, partitionKey), out var eventData))
         {
-            var eventWrapper = JsonSerializer.Deserialize<EventWrapper>(data, EventStoreSerializerOptions.Options);
-            if (eventWrapper.StreamInfo.Version >= version)
-            {
-                eventWrappers.Add(eventWrapper);
-            }
+            return new List<EventWrapper>();
         }
 
-        eventWrappers = eventWrappers.OrderBy(x => x.StreamInfo.Version).ToList();
-        return eventWrappers;
+        List<string> snapshot;
+        lock (_lock)
+        {
+            snapshot = eventData.ToList();
+        }
+
+        return snapshot
+            .Select(data => JsonSerializer.Deserialize<EventWrapper>(data, EventStoreSerializerOptions.Options)!)
+            .Where(w => w.StreamInfo.Version >= version)
+            .OrderBy(x => x.StreamInfo.Version)
+            .ToList();
     }
 
     private static List<EventWrapper> PrepareEvents(
-        EventUserInfo eventUserInfo, Guid streamId, int expectedVersion, IEnumerable<IEvent> events
+        EventUserInfo eventUserInfo, Guid streamId, int expectedVersion, IList<IEvent> events
     )
     {
         if (eventUserInfo.UserId == Guid.Empty)
             throw new Exception("UserInfo.Id must be set to a value.");
 
-        var items = events.Select(
-            e => new EventWrapper
+        var wrappers = new List<EventWrapper>(events.Count);
+        foreach (var e in events)
+        {
+            wrappers.Add(new EventWrapper
             {
-                // Id = $"{streamId}:{++expectedVersion}:{e.GetType().Name}",
-                Id = Guid.NewGuid(), //:{e.GetType().Name}",
+                Id = Guid.NewGuid(),
                 StreamInfo = new StreamInfo { Id = streamId, Version = ++expectedVersion },
                 EventType = e.GetType().AssemblyQualifiedName,
                 EventData = JsonSerializer.SerializeToElement(e, e.GetType(), EventStoreSerializerOptions.Options),
                 UserInfo = JsonSerializer.SerializeToElement(eventUserInfo, eventUserInfo.GetType(), EventStoreSerializerOptions.Options)
-            }
-        );
+            });
+        }
 
-        return items.ToList();
+        return wrappers;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        return ValueTask.CompletedTask;
     }
 }

@@ -26,6 +26,7 @@ public class UserAccountEmailAddress : AggregateBase
 
     public UserAccountEmailAddress(string emailAddress) : base()
     {
+        EmailAddress = emailAddress;
         Apply(new UserAccountEmailRegistered(emailAddress));
     }
     public void ChangeEmailAddress(string newEmail)
@@ -47,7 +48,6 @@ public class UserAccountEmailAddress : AggregateBase
 
     public void On(UserAccountEmailRegistered @event)
     {
-        Id = @event.AggregateId;
         EmailAddress = @event.EmailAddress;
         ConfirmedAt = null;
     }

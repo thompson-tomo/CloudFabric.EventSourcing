@@ -32,7 +32,7 @@ public class UserAccountsProjectionBuilder : ProjectionBuilder<UserAccountsProje
     public async System.Threading.Tasks.Task On(UserAccountEmailAddressChanged evt)
     {
         await UpdateDocument(
-            evt.AggregateId,
+            evt.UserAccountId,
             evt.PartitionKey,
             evt.Timestamp,
             (projectionDocument) =>
@@ -45,7 +45,7 @@ public class UserAccountsProjectionBuilder : ProjectionBuilder<UserAccountsProje
     public async System.Threading.Tasks.Task On(UserAccountEmailAddressConfirmed evt)
     {
         await UpdateDocument(
-            evt.AggregateId,
+            evt.UserAccountId,
             evt.PartitionKey,
             evt.Timestamp,
             (projectionDocument) =>
@@ -58,7 +58,7 @@ public class UserAccountsProjectionBuilder : ProjectionBuilder<UserAccountsProje
     public async System.Threading.Tasks.Task On(UserAccountEmailAssigned evt)
     {
         await UpdateDocument(
-            evt.AggregateId,
+            evt.UserAccountId,
             evt.PartitionKey,
             evt.Timestamp,
             (projectionDocument) =>

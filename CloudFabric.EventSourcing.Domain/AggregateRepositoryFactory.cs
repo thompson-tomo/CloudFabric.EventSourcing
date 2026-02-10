@@ -13,13 +13,6 @@ public class AggregateRepositoryFactory
 
     public AggregateRepository<TAggregate> GetAggregateRepository<TAggregate>() where TAggregate : AggregateBase
     {
-        var repository = Activator.CreateInstance(typeof(AggregateRepository<TAggregate>), _eventStore);
-
-        if (repository == null)
-        {
-            throw new ArgumentException($"Could not create AggregateRepository<${typeof(TAggregate).FullName}>");
-        }
-
-        return (AggregateRepository<TAggregate>)repository;
+        return new AggregateRepository<TAggregate>(_eventStore);
     }
 }

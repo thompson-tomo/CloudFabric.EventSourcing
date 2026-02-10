@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using CloudFabric.Projections;
 using CloudFabric.Projections.Attributes;
 
@@ -30,4 +31,7 @@ public class TaskListProjectionItem : ProjectionDocument
     
     [ProjectionDocumentProperty]
     public double Position { get; set; }
+
+    [ProjectionDocumentProperty]
+    public List<TaskListShareProjection> SharedUsers { get; set; } = new();
 }

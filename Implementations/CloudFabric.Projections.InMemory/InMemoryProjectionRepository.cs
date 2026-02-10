@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using CloudFabric.Projections.Queries;
 using Microsoft.Extensions.Logging;
 
@@ -7,15 +8,17 @@ public class InMemoryProjectionRepository<TProjectionDocument>
     : InMemoryProjectionRepository, IProjectionRepository<TProjectionDocument>
     where TProjectionDocument : ProjectionDocument
 {
-    public InMemoryProjectionRepository(ILoggerFactory loggerFactory) : 
-        base(ProjectionDocumentSchemaFactory.FromTypeWithAttributes<TProjectionDocument>(), loggerFactory)
+    public InMemoryProjectionRepository(
+        ConcurrentDictionary<string, ConcurrentDictionary<(string Id, string PartitionKey), Dictionary<string, object?>>> storage,
+        ILoggerFactory loggerFactory
+    ) : base(ProjectionDocumentSchemaFactory.FromTypeWithAttributes<TProjectionDocument>(), storage, loggerFactory)
     {
     }
 
     public new async Task<TProjectionDocument?> Single(
-        Guid id, 
-        string partitionKey, 
-        CancellationToken cancellationToken = default, 
+        Guid id,
+        string partitionKey,
+        CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.ReadOnly
     ) {
         var document = await base.Single(id, partitionKey, cancellationToken, indexSelector);
@@ -29,10 +32,10 @@ public class InMemoryProjectionRepository<TProjectionDocument>
     }
 
     public Task Upsert(
-        TProjectionDocument document, 
-        string partitionKey, 
-        DateTime updatedAt, 
-        CancellationToken cancellationToken = default, 
+        TProjectionDocument document,
+        string partitionKey,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
     ) {
         var documentDictionary = ProjectionDocumentSerializer.SerializeToDictionary(document);
@@ -73,55 +76,67 @@ public class InMemoryProjectionRepository : ProjectionRepository
     private readonly ProjectionDocumentSchema _projectionDocumentSchema;
 
     /// <summary>
-    /// Data storage 
+    /// Data storage
     /// </summary>                     Index name         Item Id and PartitionKey                     Item properties and values
-    private static readonly Dictionary<string, Dictionary<(string Id, string PartitionKey), Dictionary<string, object?>>> Storage = new();
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<(string Id, string PartitionKey), Dictionary<string, object?>>> _storage;
 
-    public InMemoryProjectionRepository(ProjectionDocumentSchema projectionDocumentSchema, ILoggerFactory loggerFactory)
-        : base(projectionDocumentSchema, loggerFactory.CreateLogger<ProjectionRepository>())
+    public InMemoryProjectionRepository(
+        ProjectionDocumentSchema projectionDocumentSchema,
+        ConcurrentDictionary<string, ConcurrentDictionary<(string Id, string PartitionKey), Dictionary<string, object?>>> storage,
+        ILoggerFactory loggerFactory
+    ) : base(projectionDocumentSchema, loggerFactory.CreateLogger<ProjectionRepository>())
     {
         _projectionDocumentSchema = projectionDocumentSchema;
-        
-        Storage.TryAdd(PROJECTION_INDEX_STATE_INDEX_NAME, new Dictionary<(string Id, string PartitionKey), Dictionary<string, object?>>());
+        _storage = storage;
+
+        _storage.TryAdd(PROJECTION_INDEX_STATE_INDEX_NAME, new ConcurrentDictionary<(string Id, string PartitionKey), Dictionary<string, object?>>());
     }
 
     protected override Task CreateIndex(string indexName, ProjectionDocumentSchema projectionDocumentSchema)
     {
-        if (!Storage.ContainsKey(indexName))
-        {
-            Storage[indexName] = new();
-        }
-        
+        _storage.TryAdd(indexName, new ConcurrentDictionary<(string Id, string PartitionKey), Dictionary<string, object?>>());
+
         return Task.CompletedTask;
     }
 
     public override async Task<Dictionary<string, object?>?> Single(
-        Guid id, 
-        string partitionKey, 
-        CancellationToken cancellationToken = default, 
+        Guid id,
+        string partitionKey,
+        CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.ReadOnly
     ) {
         var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
-        
-        var storage = Storage[indexDescriptor.IndexName];
-        
-        return storage.GetValueOrDefault((id.ToString(), partitionKey)) ?? null;
+
+        if (!_storage.TryGetValue(indexDescriptor.IndexName, out var storage))
+        {
+            return null;
+        }
+
+        if (storage.TryGetValue((id.ToString(), partitionKey), out var document))
+        {
+            return new Dictionary<string, object?>(document);
+        }
+
+        return null;
     }
 
     public override async Task Delete(
-        Guid id, 
-        string partitionKey, 
-        CancellationToken cancellationToken = default, 
+        Guid id,
+        string partitionKey,
+        CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
     ) {
         var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
-        
-        Storage[indexDescriptor.IndexName].Remove((id.ToString(), partitionKey));
+
+        if (_storage.TryGetValue(indexDescriptor.IndexName, out var storage))
+        {
+            storage.TryRemove((id.ToString(), partitionKey), out _);
+        }
     }
 
     public override async Task DeleteAll(
-        string? partitionKey = null, 
-        CancellationToken cancellationToken = default, 
+        string? partitionKey = null,
+        CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
     ) {
         var indexState = await GetProjectionIndexState(cancellationToken);
@@ -130,33 +145,38 @@ public class InMemoryProjectionRepository : ProjectionRepository
         {
             return;
         }
-        
+
         foreach (var indexStatus in indexState.IndexesStatuses)
         {
+            if (!_storage.TryGetValue(indexStatus.IndexName, out var storage))
+            {
+                continue;
+            }
+
             if (partitionKey == null)
             {
-                Storage[indexStatus.IndexName].Clear();
+                storage.Clear();
             }
             else
             {
-                var allToRemove = Storage[indexStatus.IndexName].Where(kv => kv.Key.PartitionKey == partitionKey);
+                var keysToRemove = storage.Keys.Where(k => k.PartitionKey == partitionKey).ToList();
 
-                foreach (var toRemove in allToRemove)
+                foreach (var key in keysToRemove)
                 {
-                    Storage[indexStatus.IndexName].Remove(toRemove.Key);
+                    storage.TryRemove(key, out _);
                 }
             }
         }
-        
+
         indexState.IndexesStatuses.Clear();
         await SaveProjectionIndexState(indexState);
     }
 
-    protected override async Task UpsertInternal(
+    protected override Task UpsertInternal(
         ProjectionOperationIndexDescriptor indexDescriptor,
-        Dictionary<string, object?> document, 
-        string partitionKey, 
-        DateTime updatedAt, 
+        Dictionary<string, object?> document,
+        string partitionKey,
+        DateTime updatedAt,
         CancellationToken cancellationToken = default
     ) {
         var keyValue = document[indexDescriptor.ProjectionDocumentSchema.KeyColumnName];
@@ -164,27 +184,35 @@ public class InMemoryProjectionRepository : ProjectionRepository
         {
             throw new ArgumentException("document.Id could not be null", indexDescriptor.ProjectionDocumentSchema.KeyColumnName);
         }
-        
-        document.TryGetValue(nameof(ProjectionDocument.Id), out object? id);
+
         document[nameof(ProjectionDocument.PartitionKey)] = partitionKey;
         document[nameof(ProjectionDocument.UpdatedAt)] = updatedAt;
 
-        Storage[indexDescriptor.IndexName][(keyValue.ToString()!, partitionKey)] = document;
+        var storage = _storage.GetOrAdd(indexDescriptor.IndexName, _ => new ConcurrentDictionary<(string Id, string PartitionKey), Dictionary<string, object?>>());
+        storage[(keyValue.ToString()!, partitionKey)] = document;
+
+        return Task.CompletedTask;
     }
 
-    
-    protected override async Task<ProjectionQueryResult<Dictionary<string, object?>>> QueryInternal(
+    protected override Task<ProjectionQueryResult<Dictionary<string, object?>>> QueryInternal(
         ProjectionOperationIndexDescriptor indexDescriptor,
         ProjectionQuery projectionQuery,
         string? partitionKey = null,
         CancellationToken cancellationToken = default
     ) {
-        var storage = Storage[indexDescriptor.IndexName];
-        
+        if (!_storage.TryGetValue(indexDescriptor.IndexName, out var storage))
+        {
+            return Task.FromResult(new ProjectionQueryResult<Dictionary<string, object?>>
+            {
+                IndexName = indexDescriptor.IndexName,
+                TotalRecordsFound = 0,
+                Records = new List<QueryResultDocument<Dictionary<string, object?>>>()
+            });
+        }
+
         var result = storage
             .Where(x => string.IsNullOrEmpty(partitionKey) || x.Key.PartitionKey == partitionKey)
-            .ToDictionary(k => k.Key, v => v.Value)
-            .Values
+            .Select(x => new Dictionary<string, object?>(x.Value))
             .AsEnumerable();
 
         var expression = projectionQuery.FiltersToExpression<Dictionary<string, object?>>();
@@ -198,15 +226,42 @@ public class InMemoryProjectionRepository : ProjectionRepository
         {
             var searchableProperties = indexDescriptor.ProjectionDocumentSchema.Properties
                 .Where(x => x.IsSearchable)
-                .Select(x => x.PropertyName);
+                .Select(x => x.PropertyName)
+                .ToHashSet();
 
-            result = result.Where(x => 
+            result = result.Where(x =>
                 x.Any(
-                    w => searchableProperties.Contains(w.Key) 
-                        && w.Value is string 
-                        && ((string)w.Value).ToLower().Contains(projectionQuery.SearchText.ToLower())
+                    w => searchableProperties.Contains(w.Key)
+                        && w.Value is string s
+                        && s.Contains(projectionQuery.SearchText, StringComparison.OrdinalIgnoreCase)
                 )
             );
+        }
+
+        if (projectionQuery.OrderBy.Count > 0)
+        {
+            IOrderedEnumerable<Dictionary<string, object?>>? ordered = null;
+
+            foreach (var sort in projectionQuery.OrderBy)
+            {
+                Func<Dictionary<string, object?>, object?> keySelector = d =>
+                    d.TryGetValue(sort.KeyPath, out var val) ? val : null;
+
+                if (ordered == null)
+                {
+                    ordered = string.Equals(sort.Order, "desc", StringComparison.OrdinalIgnoreCase)
+                        ? result.OrderByDescending(keySelector)
+                        : result.OrderBy(keySelector);
+                }
+                else
+                {
+                    ordered = string.Equals(sort.Order, "desc", StringComparison.OrdinalIgnoreCase)
+                        ? ordered.ThenByDescending(keySelector)
+                        : ordered.ThenBy(keySelector);
+                }
+            }
+
+            result = ordered!;
         }
 
         var totalCount = result.LongCount();
@@ -218,7 +273,7 @@ public class InMemoryProjectionRepository : ProjectionRepository
             result = result.Take(projectionQuery.Limit.Value);
         }
 
-        return new ProjectionQueryResult<Dictionary<string, object?>>
+        return Task.FromResult(new ProjectionQueryResult<Dictionary<string, object?>>
         {
             IndexName = indexDescriptor.IndexName,
             TotalRecordsFound = totalCount,
@@ -229,6 +284,6 @@ public class InMemoryProjectionRepository : ProjectionRepository
                     }
                 )
                 .ToList()
-        };
+        });
     }
 }

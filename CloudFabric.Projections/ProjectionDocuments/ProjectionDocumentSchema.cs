@@ -24,6 +24,8 @@ public class ProjectionDocumentSchema : ICloneable
 
     public object Clone()
     {
-        return MemberwiseClone();
+        var clone = (ProjectionDocumentSchema)MemberwiseClone();
+        clone.Properties = Properties.Select(p => p.Clone()).ToList();
+        return clone;
     }
 }

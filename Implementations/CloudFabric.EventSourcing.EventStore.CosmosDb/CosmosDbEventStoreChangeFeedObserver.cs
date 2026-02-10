@@ -29,11 +29,9 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
     protected readonly string _leaseContainerId;
     protected readonly string _leaseDatabaseId;
     private ChangeFeedProcessor _changeFeedProcessor;
-    private Func<IEvent, Task> _eventHandler;
 
     private string _processorName;
-
-    private ILogger<CosmosDbEventStoreChangeFeedObserver> _logger;
+    private readonly TimeSpan _changeFeedStartTimeOffset;
 
     public CosmosDbEventStoreChangeFeedObserver(
         CosmosClient eventsClient,
@@ -43,7 +41,8 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
         string leaseDatabaseId,
         string leaseContainerId,
         string processorName,
-        ILogger<CosmosDbEventStoreChangeFeedObserver> logger
+        ILogger<CosmosDbEventStoreChangeFeedObserver> logger,
+        TimeSpan? changeFeedStartTimeOffset = null
     ): base(new CosmosDbEventStore(eventsClient, eventsDatabaseId, eventsContainerId), logger)
     {
         _eventsClient = eventsClient;
@@ -55,13 +54,7 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
         _leaseContainerId = leaseContainerId;
 
         _processorName = processorName;
-
-        _logger = logger;
-    }
-
-    public void SetEventHandler(Func<IEvent, Task> eventHandler)
-    {
-        _eventHandler = eventHandler;
+        _changeFeedStartTimeOffset = changeFeedStartTimeOffset ?? TimeSpan.FromMinutes(-50);
     }
 
     public override Task StartAsync(string instanceName)
@@ -77,7 +70,7 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
             .GetChangeFeedProcessorBuilder<Change>(_processorName, HandleChangesAsync)
             .WithInstanceName(instanceName)
             .WithLeaseContainer(leaseContainer)
-            .WithStartTime(DateTime.UtcNow.AddMinutes(-50))
+            .WithStartTime(DateTime.UtcNow.Add(_changeFeedStartTimeOffset))
             .Build();
         
         _logger.LogInformation("Starting {InstanceName}", instanceName);
@@ -192,7 +185,7 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
             foreach (var eventWrapper in response)
             {
                 var @event = eventWrapper.GetEvent();
-                await _eventHandler(@event);
+                await EventStoreOnEventAdded(@event);
             }
         }
     }
@@ -203,7 +196,7 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
         {
             var @event = change.GetEvent();
 
-            await _eventHandler(@event);
+            await EventStoreOnEventAdded(@event);
         }
     }
 }

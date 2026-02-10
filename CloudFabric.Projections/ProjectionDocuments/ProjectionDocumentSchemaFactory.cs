@@ -21,7 +21,7 @@ public static class ProjectionDocumentSchemaFactory
     
     public static string GetPropertiesUniqueHash(List<ProjectionDocumentPropertySchema> properties)
     {
-        var hash = new System.IO.Hashing.XxHash32();
+        var hash = new System.IO.Hashing.XxHash64();
         
         foreach (var prop in properties)
         {

@@ -1,3 +1,4 @@
+using System;
 using System.Diagnostics;
 using AutoMapper;
 using CloudFabric.EventSourcing.Domain;
@@ -51,11 +52,286 @@ public class TaskListsService : ITaskListsService
 
         if (task == null)
         {
-            return ServiceResult<TaskViewModel>.Failed("task_list_not_found", "Task list does not exist");
+            return ServiceResult<TaskViewModel>.Failed("task_not_found", "Task does not exist");
         }
 
         task.UpdatePosition(request.NewTaskListId, request.NewPosition);
         
+        await _tasksRepository.SaveAsync(_userInfo, task, cancellationToken);
+
+        return ServiceResult<TaskViewModel>.Success(_mapper.Map<TaskViewModel>(task));
+    }
+
+    public async Task<ServiceResult<TaskViewModel>> AddSubTask(AddSubTaskRequest request, CancellationToken cancellationToken)
+    {
+        var validationProblemDetails = ValidationHelper.Validate(request);
+
+        if (validationProblemDetails != null)
+        {
+            return ServiceResult<TaskViewModel>.Failed(validationProblemDetails);
+        }
+
+        var task = await LoadTaskAggregate(request.TaskId!.Value, cancellationToken);
+
+        if (task == null)
+        {
+            return TaskNotFoundResult();
+        }
+
+        if (task.TaskListId != request.TaskListId!.Value)
+        {
+            return TaskDoesNotBelongToListResult();
+        }
+
+        task.AddSubTask(Guid.NewGuid(), request.Title, request.Position);
+
+        await _tasksRepository.SaveAsync(_userInfo, task, cancellationToken);
+
+        return ServiceResult<TaskViewModel>.Success(_mapper.Map<TaskViewModel>(task));
+    }
+
+    public async Task<ServiceResult<TaskViewModel>> UpdateSubTaskTitle(UpdateSubTaskTitleRequest request, CancellationToken cancellationToken)
+    {
+        var validationProblemDetails = ValidationHelper.Validate(request);
+
+        if (validationProblemDetails != null)
+        {
+            return ServiceResult<TaskViewModel>.Failed(validationProblemDetails);
+        }
+
+        var task = await LoadTaskAggregate(request.TaskId!.Value, cancellationToken);
+
+        if (task == null)
+        {
+            return TaskNotFoundResult();
+        }
+
+        if (task.TaskListId != request.TaskListId!.Value)
+        {
+            return TaskDoesNotBelongToListResult();
+        }
+
+        task.UpdateSubTaskTitle(request.SubTaskId!.Value, request.Title);
+
+        await _tasksRepository.SaveAsync(_userInfo, task, cancellationToken);
+
+        return ServiceResult<TaskViewModel>.Success(_mapper.Map<TaskViewModel>(task));
+    }
+
+    public async Task<ServiceResult<TaskViewModel>> UpdateSubTaskPosition(UpdateSubTaskPositionRequest request, CancellationToken cancellationToken)
+    {
+        var validationProblemDetails = ValidationHelper.Validate(request);
+
+        if (validationProblemDetails != null)
+        {
+            return ServiceResult<TaskViewModel>.Failed(validationProblemDetails);
+        }
+
+        var task = await LoadTaskAggregate(request.TaskId!.Value, cancellationToken);
+
+        if (task == null)
+        {
+            return TaskNotFoundResult();
+        }
+
+        if (task.TaskListId != request.TaskListId!.Value)
+        {
+            return TaskDoesNotBelongToListResult();
+        }
+
+        task.UpdateSubTaskPosition(request.SubTaskId!.Value, request.Position);
+
+        await _tasksRepository.SaveAsync(_userInfo, task, cancellationToken);
+
+        return ServiceResult<TaskViewModel>.Success(_mapper.Map<TaskViewModel>(task));
+    }
+
+    public async Task<ServiceResult<TaskViewModel>> ToggleSubTaskCompletion(ToggleSubTaskCompletionRequest request, CancellationToken cancellationToken)
+    {
+        var validationProblemDetails = ValidationHelper.Validate(request);
+
+        if (validationProblemDetails != null)
+        {
+            return ServiceResult<TaskViewModel>.Failed(validationProblemDetails);
+        }
+
+        var task = await LoadTaskAggregate(request.TaskId!.Value, cancellationToken);
+
+        if (task == null)
+        {
+            return TaskNotFoundResult();
+        }
+
+        if (task.TaskListId != request.TaskListId!.Value)
+        {
+            return TaskDoesNotBelongToListResult();
+        }
+
+        task.ToggleSubTaskCompletion(request.SubTaskId!.Value, request.IsCompleted);
+
+        await _tasksRepository.SaveAsync(_userInfo, task, cancellationToken);
+
+        return ServiceResult<TaskViewModel>.Success(_mapper.Map<TaskViewModel>(task));
+    }
+
+    public async Task<ServiceResult<TaskViewModel>> RemoveSubTask(RemoveSubTaskRequest request, CancellationToken cancellationToken)
+    {
+        var validationProblemDetails = ValidationHelper.Validate(request);
+
+        if (validationProblemDetails != null)
+        {
+            return ServiceResult<TaskViewModel>.Failed(validationProblemDetails);
+        }
+
+        var task = await LoadTaskAggregate(request.TaskId!.Value, cancellationToken);
+
+        if (task == null)
+        {
+            return TaskNotFoundResult();
+        }
+
+        if (task.TaskListId != request.TaskListId!.Value)
+        {
+            return TaskDoesNotBelongToListResult();
+        }
+
+        task.RemoveSubTask(request.SubTaskId!.Value);
+
+        await _tasksRepository.SaveAsync(_userInfo, task, cancellationToken);
+
+        return ServiceResult<TaskViewModel>.Success(_mapper.Map<TaskViewModel>(task));
+    }
+
+    public async Task<ServiceResult<TaskViewModel>> AddTaskAttachment(AddTaskAttachmentRequest request, CancellationToken cancellationToken)
+    {
+        var validationProblemDetails = ValidationHelper.Validate(request);
+
+        if (validationProblemDetails != null)
+        {
+            return ServiceResult<TaskViewModel>.Failed(validationProblemDetails);
+        }
+
+        var task = await LoadTaskAggregate(request.TaskId!.Value, cancellationToken);
+
+        if (task == null)
+        {
+            return TaskNotFoundResult();
+        }
+
+        if (task.TaskListId != request.TaskListId!.Value)
+        {
+            return TaskDoesNotBelongToListResult();
+        }
+
+        var attachmentId = request.AttachmentId ?? Guid.NewGuid();
+
+        task.AddAttachment(
+            attachmentId,
+            request.OriginalFileName,
+            request.StoredFilePath,
+            request.ThumbnailFilePath,
+            request.SizeBytes,
+            request.ContentType
+        );
+
+        await _tasksRepository.SaveAsync(_userInfo, task, cancellationToken);
+
+        return ServiceResult<TaskViewModel>.Success(_mapper.Map<TaskViewModel>(task));
+    }
+
+    public async Task<ServiceResult<TaskViewModel>> RemoveTaskAttachment(RemoveTaskAttachmentRequest request, CancellationToken cancellationToken)
+    {
+        var validationProblemDetails = ValidationHelper.Validate(request);
+
+        if (validationProblemDetails != null)
+        {
+            return ServiceResult<TaskViewModel>.Failed(validationProblemDetails);
+        }
+
+        var task = await LoadTaskAggregate(request.TaskId!.Value, cancellationToken);
+
+        if (task == null)
+        {
+            return TaskNotFoundResult();
+        }
+
+        if (task.TaskListId != request.TaskListId!.Value)
+        {
+            return TaskDoesNotBelongToListResult();
+        }
+
+        task.RemoveAttachment(request.AttachmentId!.Value);
+
+        await _tasksRepository.SaveAsync(_userInfo, task, cancellationToken);
+
+        return ServiceResult<TaskViewModel>.Success(_mapper.Map<TaskViewModel>(task));
+    }
+
+    public async Task<ServiceResult<TaskViewModel>> UpdateTaskDueDate(UpdateTaskDueDateRequest request, CancellationToken cancellationToken)
+    {
+        var validationProblemDetails = ValidationHelper.Validate(request);
+
+        if (validationProblemDetails != null)
+        {
+            return ServiceResult<TaskViewModel>.Failed(validationProblemDetails);
+        }
+
+        var task = await LoadTaskAggregate(request.TaskId!.Value, cancellationToken);
+
+        if (task == null)
+        {
+            return TaskNotFoundResult();
+        }
+
+        if (task.TaskListId != request.TaskListId!.Value)
+        {
+            return TaskDoesNotBelongToListResult();
+        }
+
+        if (request.DueDate.HasValue)
+        {
+            task.SetDueDate(request.DueDate.Value);
+        }
+        else
+        {
+            task.ClearDueDate();
+        }
+
+        await _tasksRepository.SaveAsync(_userInfo, task, cancellationToken);
+
+        return ServiceResult<TaskViewModel>.Success(_mapper.Map<TaskViewModel>(task));
+    }
+
+    public async Task<ServiceResult<TaskViewModel>> UpdateTaskReminder(UpdateTaskReminderRequest request, CancellationToken cancellationToken)
+    {
+        var validationProblemDetails = ValidationHelper.Validate(request);
+
+        if (validationProblemDetails != null)
+        {
+            return ServiceResult<TaskViewModel>.Failed(validationProblemDetails);
+        }
+
+        var task = await LoadTaskAggregate(request.TaskId!.Value, cancellationToken);
+
+        if (task == null)
+        {
+            return TaskNotFoundResult();
+        }
+
+        if (task.TaskListId != request.TaskListId!.Value)
+        {
+            return TaskDoesNotBelongToListResult();
+        }
+
+        if (request.ReminderAt.HasValue)
+        {
+            task.ScheduleReminder(request.ReminderAt.Value);
+        }
+        else
+        {
+            task.ClearReminder();
+        }
+
         await _tasksRepository.SaveAsync(_userInfo, task, cancellationToken);
 
         return ServiceResult<TaskViewModel>.Success(_mapper.Map<TaskViewModel>(task));
@@ -190,6 +466,52 @@ public class TaskListsService : ITaskListsService
         return ServiceResult<TaskListViewModel>.Success(_mapper.Map<TaskListViewModel>(taskList));
     }
 
+    public async Task<ServiceResult<TaskListViewModel>> ShareTaskList(ShareTaskListRequest request, CancellationToken cancellationToken)
+    {
+        var validationProblemDetails = ValidationHelper.Validate(request);
+
+        if (validationProblemDetails != null)
+        {
+            return ServiceResult<TaskListViewModel>.Failed(validationProblemDetails);
+        }
+
+        var taskList = await LoadTaskListAggregate(request.TaskListId!.Value, cancellationToken);
+
+        if (taskList == null)
+        {
+            return TaskListNotFoundResult();
+        }
+
+        taskList.ShareWithUser(request.SharedUserId!.Value, request.SharedUserEmail, request.CanEdit);
+
+        await _taskListsRepository.SaveAsync(_userInfo, taskList, cancellationToken);
+
+        return ServiceResult<TaskListViewModel>.Success(_mapper.Map<TaskListViewModel>(taskList));
+    }
+
+    public async Task<ServiceResult<TaskListViewModel>> RevokeTaskListShare(RevokeTaskListShareRequest request, CancellationToken cancellationToken)
+    {
+        var validationProblemDetails = ValidationHelper.Validate(request);
+
+        if (validationProblemDetails != null)
+        {
+            return ServiceResult<TaskListViewModel>.Failed(validationProblemDetails);
+        }
+
+        var taskList = await LoadTaskListAggregate(request.TaskListId!.Value, cancellationToken);
+
+        if (taskList == null)
+        {
+            return TaskListNotFoundResult();
+        }
+
+        taskList.RevokeShare(request.SharedUserId!.Value);
+
+        await _taskListsRepository.SaveAsync(_userInfo, taskList, cancellationToken);
+
+        return ServiceResult<TaskListViewModel>.Success(_mapper.Map<TaskListViewModel>(taskList));
+    }
+
     public async Task<ServiceResult<TaskViewModel>> CreateTask(CreateTaskRequest request, CancellationToken cancellationToken)
     {
         var validationProblemDetails = ValidationHelper.Validate(request);
@@ -289,5 +611,28 @@ public class TaskListsService : ITaskListsService
         return ServiceResult<Dictionary<Guid, List<TaskViewModel>>>.Success(result);
     }
 
-    
+    private Task<Domain.Task?> LoadTaskAggregate(Guid taskId, CancellationToken cancellationToken)
+    {
+        return _tasksRepository.LoadAsync(taskId, _userInfo.UserId.ToString(), cancellationToken);
+    }
+
+    private Task<TaskList?> LoadTaskListAggregate(Guid taskListId, CancellationToken cancellationToken)
+    {
+        return _taskListsRepository.LoadAsync(taskListId, _userInfo.UserId.ToString(), cancellationToken);
+    }
+
+    private static ServiceResult<TaskViewModel> TaskNotFoundResult()
+    {
+        return ServiceResult<TaskViewModel>.Failed("task_not_found", "Task does not exist");
+    }
+
+    private static ServiceResult<TaskViewModel> TaskDoesNotBelongToListResult()
+    {
+        return ServiceResult<TaskViewModel>.ValidationFailedOneParam("task_list_id", "Task does not belong to the provided task list");
+    }
+
+    private static ServiceResult<TaskListViewModel> TaskListNotFoundResult()
+    {
+        return ServiceResult<TaskListViewModel>.Failed("task_list_not_found", "Task list does not exist");
+    }
 }

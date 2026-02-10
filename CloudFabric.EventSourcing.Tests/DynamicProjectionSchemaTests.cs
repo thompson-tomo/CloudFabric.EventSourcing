@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.EventStore.Persistence;
 using CloudFabric.EventSourcing.Tests.Domain;
@@ -149,8 +148,9 @@ public abstract class DynamicProjectionSchemaTests
                 );
             await projectionRepository.DeleteAll();
         }
-        catch
+        catch (Exception ex)
         {
+            Console.WriteLine($"Cleanup warning: {ex.Message}");
         }
     }
 
@@ -272,9 +272,9 @@ public abstract class DynamicProjectionSchemaTests
         await Task.Delay(ProjectionsUpdateDelay);
 
         var orderProjection = await ordersListProjectionsRepository.Single(id, PartitionKeys.GetOrderPartitionKey());
-        Debug.Assert(orderProjection != null, nameof(orderProjection) + " != null");
+        orderProjection.Should().NotBeNull();
 
-        orderProjection["Id"].Should().Be(order.Id);
+        orderProjection!["Id"].Should().Be(order.Id);
         orderProjection["ItemsCount"].Should().Be(items.Count);
 
         var addItem = new OrderItem(DateTime.UtcNow, "Twilight Struggle", 6.95m);
@@ -292,9 +292,9 @@ public abstract class DynamicProjectionSchemaTests
         order2.Items.Count.Should().Be(4);
 
         var orderProjection2 = await ordersListProjectionsRepository.Single(id, PartitionKeys.GetOrderPartitionKey());
-        Debug.Assert(orderProjection2 != null, nameof(orderProjection2) + " != null");
+        orderProjection2.Should().NotBeNull();
 
-        orderProjection2["Name"].Should().Be(orderName);
+        orderProjection2!["Name"].Should().Be(orderName);
         orderProjection2["ItemsCount"].Should().Be(4);
 
         var orderProjectionFromQuery =
@@ -389,8 +389,8 @@ public abstract class DynamicProjectionSchemaTests
         await Task.Delay(ProjectionsUpdateDelay);
 
         var orderProjection = await ordersListProjectionsRepository.Single(id, PartitionKeys.GetOrderPartitionKey());
-        Debug.Assert(orderProjection != null, nameof(orderProjection) + " != null");
-        
+        orderProjection.Should().NotBeNull();
+
         var query = new ProjectionQuery();
         query.Filters = new List<Filter>()
         {
@@ -491,7 +491,7 @@ public abstract class DynamicProjectionSchemaTests
             TimeSpan.FromSeconds(10)
         );
         
-        Debug.Assert(orderProjection != null, nameof(orderProjection) + " != null");
+        orderProjection.Should().NotBeNull();
 
         orderProjection["Id"].Should().Be(order.Id);
         orderProjection["ItemsCount"].Should().Be(3);
@@ -508,7 +508,7 @@ public abstract class DynamicProjectionSchemaTests
             ProjectionsUpdateDelay
         );
         
-        Debug.Assert(orderProjectionWithNewItem != null, nameof(orderProjection) + " != null");
+        orderProjectionWithNewItem.Should().NotBeNull();
 
         orderProjectionWithNewItem["Id"].Should().Be(order.Id);
         orderProjectionWithNewItem["ItemsCount"].Should().Be(itemsCountShouldBe);
@@ -536,7 +536,7 @@ public abstract class DynamicProjectionSchemaTests
         
         var orderProjectionWithNewSchemaTotalPrice = await ordersListProjectionsRepository
             .Single(id, PartitionKeys.GetOrderPartitionKey());
-        Debug.Assert(orderProjectionWithNewSchemaTotalPrice != null, nameof(orderProjectionWithNewSchemaTotalPrice) + " != null");
+        orderProjectionWithNewSchemaTotalPrice.Should().NotBeNull();
 
         orderProjectionWithNewSchemaTotalPrice["Id"].Should().Be(order.Id);
         orderProjectionWithNewSchemaTotalPrice["ItemsCount"].Should().Be(5);
@@ -545,7 +545,7 @@ public abstract class DynamicProjectionSchemaTests
 
         var orderProjectionWithNewSchemaTotalPriceAfterRebuild = await ordersListProjectionsRepository
             .Single(id, PartitionKeys.GetOrderPartitionKey());
-        Debug.Assert(orderProjectionWithNewSchemaTotalPriceAfterRebuild != null, nameof(orderProjectionWithNewSchemaTotalPriceAfterRebuild) + " != null");
+        orderProjectionWithNewSchemaTotalPriceAfterRebuild.Should().NotBeNull();
 
         orderProjectionWithNewSchemaTotalPriceAfterRebuild["Id"].Should().Be(order.Id);
         orderProjectionWithNewSchemaTotalPriceAfterRebuild["ItemsCount"].Should().Be(5);
@@ -557,7 +557,121 @@ public abstract class DynamicProjectionSchemaTests
     [TestMethod]
     public async Task TestPlaceOrderAndAddItemtoDynamicProjectionWithRemovingProjectionField()
     {
-        // todo: same as previous, but with additional step:
-        // removing a projection field and then making sure it's removed from underlying projection storage (new column in postgresql/new index in elastic etc)
+        // Step 1 - Create schema WITH TotalPrice, create order, verify TotalPrice works
+
+        var orderRepository = new OrderRepository(await GetEventStore());
+        var orderRepositoryEventsObserver = GetEventStoreEventsObserver();
+
+        var ordersProjectionSchema = new ProjectionDocumentSchema()
+        {
+            SchemaName = _projectionsSchemaName,
+            Properties = new List<ProjectionDocumentPropertySchema>()
+            {
+                new ProjectionDocumentPropertySchema()
+                {
+                    PropertyName = "Id",
+                    IsKey = true,
+                    PropertyType = TypeCode.Object
+                },
+                new ProjectionDocumentPropertySchema()
+                {
+                    PropertyName = "Name",
+                    IsFilterable = true,
+                    IsSearchable = true,
+                    PropertyType = TypeCode.String
+                },
+                new ProjectionDocumentPropertySchema()
+                {
+                    PropertyName = "ItemsCount",
+                    IsFilterable = true,
+                    PropertyType = TypeCode.Int32
+                },
+                new ProjectionDocumentPropertySchema()
+                {
+                    PropertyName = "TotalPrice",
+                    IsFilterable = true,
+                    PropertyType = TypeCode.Decimal
+                }
+            }
+        };
+
+        var (projectionsEngine, ordersListProjectionsRepository) = await PrepareProjections(orderRepositoryEventsObserver, ordersProjectionSchema);
+        var projectionsRebuildProcessor = PrepareProjectionsRebuildProcessor(orderRepositoryEventsObserver, ordersProjectionSchema);
+
+        await ordersListProjectionsRepository.EnsureIndex();
+        await projectionsRebuildProcessor.RebuildProjectionsThatRequireRebuild();
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+        var id = Guid.NewGuid();
+        var orderName = "New Year's Gifts";
+        var items = new List<OrderItem>
+        {
+            new OrderItem(DateTime.UtcNow, "Colonizing Mars", 12.00m),
+            new OrderItem(DateTime.UtcNow, "Dixit", 6.59m),
+            new OrderItem(DateTime.UtcNow, "Time Stories", 4.85m)
+        };
+
+        var order = new Order(id, orderName, items, userId, "john@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order);
+
+        var orderProjection = await TestHelpers.RepeatUntilNotNull(
+            () => ordersListProjectionsRepository.Single(id, PartitionKeys.GetOrderPartitionKey()),
+            TimeSpan.FromSeconds(10)
+        );
+
+        orderProjection.Should().NotBeNull();
+        orderProjection["Id"].Should().Be(order.Id);
+        orderProjection["ItemsCount"].Should().Be(3);
+        orderProjection["TotalPrice"].Should().Be(23.44m); // 12.00 + 6.59 + 4.85
+
+        order.AddItem(new OrderItem(DateTime.UtcNow, "Caverna", 12m));
+        await orderRepository.SaveOrder(userInfo, order);
+
+        var orderProjectionWith4Items = await TestHelpers.RepeatUntil(
+            () => ordersListProjectionsRepository.Single(id, PartitionKeys.GetOrderPartitionKey()),
+            a => a != null && a["ItemsCount"] as dynamic == 4,
+            ProjectionsUpdateDelay
+        );
+
+        orderProjectionWith4Items.Should().NotBeNull();
+        orderProjectionWith4Items["ItemsCount"].Should().Be(4);
+        orderProjectionWith4Items["TotalPrice"].Should().Be(35.44m); // 23.44 + 12.00
+
+        await projectionsEngine.StopAsync();
+
+        // Step 2 - Remove TotalPrice from schema
+
+        ordersProjectionSchema.Properties.RemoveAll(p => p.PropertyName == "TotalPrice");
+
+        (projectionsEngine, ordersListProjectionsRepository) = await PrepareProjections(orderRepositoryEventsObserver, ordersProjectionSchema);
+        await ordersListProjectionsRepository.EnsureIndex();
+
+        // Add another item to ensure new events are processed
+        var addItem = new OrderItem(DateTime.UtcNow, "Twilight Struggle", 6.95m);
+        order.AddItem(addItem);
+        await orderRepository.SaveOrder(userInfo, order);
+
+        // Before rebuild, reads still go to old index which has TotalPrice
+        var orderProjectionBeforeRebuild = await ordersListProjectionsRepository
+            .Single(id, PartitionKeys.GetOrderPartitionKey());
+        orderProjectionBeforeRebuild.Should().NotBeNull();
+        orderProjectionBeforeRebuild!["ItemsCount"].Should().Be(5);
+
+        // Rebuild replays all events into the new index which does not have TotalPrice
+        await projectionsRebuildProcessor.RebuildProjectionsThatRequireRebuild();
+
+        var orderProjectionAfterRebuild = await ordersListProjectionsRepository
+            .Single(id, PartitionKeys.GetOrderPartitionKey());
+        orderProjectionAfterRebuild.Should().NotBeNull();
+
+        orderProjectionAfterRebuild!["Id"].Should().Be(order.Id);
+        orderProjectionAfterRebuild["Name"].Should().Be(orderName);
+        orderProjectionAfterRebuild["ItemsCount"].Should().Be(5);
+
+        // TotalPrice should no longer exist in the projection after rebuild
+        orderProjectionAfterRebuild.ContainsKey("TotalPrice").Should().BeFalse();
+
+        await projectionsEngine.StopAsync();
     }
 }

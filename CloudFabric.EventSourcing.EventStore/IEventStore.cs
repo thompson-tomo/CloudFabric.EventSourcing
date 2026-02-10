@@ -2,7 +2,7 @@ using CloudFabric.EventSourcing.EventStore.Persistence;
 
 namespace CloudFabric.EventSourcing.EventStore;
 
-public interface IEventStore
+public interface IEventStore : IAsyncDisposable
 {
     Task<EventStream> LoadStreamAsyncOrThrowNotFound(Guid streamId, string partitionKey, CancellationToken cancellationToken =  default);
 
@@ -10,10 +10,11 @@ public interface IEventStore
 
     Task<EventStream> LoadStreamAsync(Guid streamId, string partitionKey, int fromVersion, CancellationToken cancellationToken = default);
 
-    Task<List<IEvent>> LoadEventsAsync(
+    Task<LoadEventsResult> LoadEventsAsync(
         string? partitionKey,
         DateTime? dateFrom = null,
         int limit = 250,
+        string? continuationToken = null,
         CancellationToken cancellationToken = default
     );
     

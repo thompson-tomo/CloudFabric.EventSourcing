@@ -9,6 +9,8 @@ public class TaskListMappingProfile : Profile
 {
     public TaskListMappingProfile()
     {
+        CreateMap<TaskListShareProjection, TaskListShareViewModel>();
+        CreateMap<TaskListShare, TaskListShareViewModel>();
         CreateMap<TaskListProjectionItem, TaskListViewModel>();
         CreateMap<TaskListProjectionItem, TaskListWithTasksViewModel>();
         CreateMap<TaskList, TaskListViewModel>();

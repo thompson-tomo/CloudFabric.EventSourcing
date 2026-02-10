@@ -48,8 +48,8 @@ public class EventStoreBenchmarks
 
 public class Program
 {
-    // public async static Task Main(string[] args)
-    // {
-    //     var summary = BenchmarkRunner.Run<EventStoreBenchmarks>();
-    // }
+    public static void Main(string[] args)
+    {
+        var summary = BenchmarkRunner.Run<EventStoreBenchmarks>();
+    }
 }

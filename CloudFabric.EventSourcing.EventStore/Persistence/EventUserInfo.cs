@@ -15,5 +15,5 @@ public record EventUserInfo
     }
 
     [JsonPropertyName("userId")]
-    public Guid UserId { get; }
+    public Guid UserId { get; init; }
 }

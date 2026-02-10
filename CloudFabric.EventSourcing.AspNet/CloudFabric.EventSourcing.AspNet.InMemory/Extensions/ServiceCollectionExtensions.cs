@@ -1,5 +1,5 @@
+using System.Collections.Concurrent;
 using CloudFabric.EventSourcing.EventStore;
-using System.Runtime.CompilerServices;
 using CloudFabric.EventSourcing.Domain;
 using CloudFabric.EventSourcing.EventStore.InMemory;
 using CloudFabric.Projections;
@@ -15,7 +15,7 @@ namespace CloudFabric.EventSourcing.AspNet.InMemory.Extensions
     {
         public static IEventSourcingBuilder AddInMemoryEventStore(
             this IServiceCollection services,
-            Dictionary<(Guid, string), List<string>> eventsContainer,
+            ConcurrentDictionary<(Guid, string), List<string>> eventsContainer,
             Dictionary<(string, string), string> itemsContainer
         )
         {
@@ -28,7 +28,6 @@ namespace CloudFabric.EventSourcing.AspNet.InMemory.Extensions
                 (sp) =>
                 {
                     var eventStore = new InMemoryEventStore(eventsContainer);
-                    eventStore.Initialize().Wait();
 
                     // add events observer for projections
                     var eventStoreObserver = new InMemoryEventStoreEventObserver(
@@ -58,7 +57,7 @@ namespace CloudFabric.EventSourcing.AspNet.InMemory.Extensions
                             projectionsEngine.AddProjectionBuilder(projectionBuilder);
                         }
 
-                        projectionsEngine.StartAsync("").GetAwaiter().GetResult();
+                        projectionsEngine.Start("");
                     }
 
                     return eventStore;
@@ -73,7 +72,7 @@ namespace CloudFabric.EventSourcing.AspNet.InMemory.Extensions
         public static IEventSourcingBuilder AddInMemoryEventStore(this IServiceCollection services)
         {
             return services.AddInMemoryEventStore(
-                new Dictionary<(Guid, string), List<string>>(),
+                new ConcurrentDictionary<(Guid, string), List<string>>(),
                 new Dictionary<(string, string), string>()
             );
         }

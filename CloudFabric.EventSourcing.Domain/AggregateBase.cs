@@ -23,6 +23,25 @@ public abstract class AggregateBase
     {
     }
 
+    /// <summary>
+    /// Use this constructor in aggregate creation constructors to set identity before applying events.
+    /// <example>
+    /// public Order(Guid id, string name) : base(id)
+    /// {
+    ///     Apply(new OrderPlaced(name));
+    /// }
+    /// </example>
+    /// </summary>
+    protected AggregateBase(Guid id)
+    {
+        if (id == Guid.Empty)
+        {
+            throw new ArgumentException("Aggregate Id cannot be empty.", nameof(id));
+        }
+
+        Id = id;
+    }
+
     public AggregateBase(IEnumerable<IEvent> events)
     {
         if (events == null)
@@ -30,7 +49,16 @@ public abstract class AggregateBase
             throw new Exception("Aggregate should not be constructed with null events list");
         }
 
-        foreach (var @event in events)
+        var eventsList = events as IList<IEvent> ?? events.ToList();
+
+        // Set identity from event stream metadata before replaying events.
+        // This decouples aggregate identity from event handler side effects.
+        if (eventsList.Count > 0)
+        {
+            Id = eventsList[0].AggregateId;
+        }
+
+        foreach (var @event in eventsList)
         {
             if (@event == null)
             {
@@ -99,12 +127,19 @@ public abstract class AggregateBase
 
     protected void Apply(IEvent @event)
     {
-        RaiseEvent(@event);
-     
-        // aggregates should not bother assigning those to events
+        if (Id == Guid.Empty)
+        {
+            throw new InvalidOperationException(
+                $"Aggregate Id must be set before calling Apply(). " +
+                $"Use the base(id) constructor: public {GetType().Name}(Guid id, ...) : base(id)"
+            );
+        }
+
         @event.AggregateId = Id;
         @event.PartitionKey = PartitionKey;
-        
+
+        RaiseEvent(@event);
+
         UncommittedEvents.Add(@event);
     }
 
