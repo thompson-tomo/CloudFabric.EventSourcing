@@ -589,6 +589,76 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         return item;
     }
 
+    protected override async Task<long> UpdateByQueryInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        ProjectionQuery query,
+        string? partitionKey,
+        Dictionary<string, object?> propertyUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
+    )
+    {
+        try
+        {
+            // Build Painless script for setting each property
+            var scriptParts = new List<string>();
+            var scriptParams = new Dictionary<string, object?>();
+
+            foreach (var (propName, propValue) in propertyUpdates)
+            {
+                scriptParts.Add($"ctx._source.{propName} = params.{propName}");
+                scriptParams[propName] = propValue;
+            }
+
+            scriptParts.Add($"ctx._source.{nameof(ProjectionDocument.UpdatedAt)} = params._updatedAt");
+            scriptParams["_updatedAt"] = updatedAt;
+
+            // Build filter query
+            var filters = query.Filters != null && query.Filters.Any()
+                ? ElasticSearchFilterFactory.ConstructFilters(query.Filters)
+                : new List<QueryContainer>();
+
+            if (!string.IsNullOrEmpty(partitionKey))
+            {
+                filters.Add(new TermQuery
+                {
+                    Field = nameof(ProjectionDocument.PartitionKey),
+                    Value = partitionKey
+                });
+            }
+
+            // Refresh the index to ensure all pending writes are searchable
+            // before running the update_by_query. Without this, documents inserted
+            // immediately before (e.g. during event replay) may not be found.
+            await _client.Indices.RefreshAsync(indexDescriptor.IndexName, ct: cancellationToken);
+
+            var response = await _client.UpdateByQueryAsync<Dictionary<string, object?>>(u =>
+            {
+                u = u.Index(indexDescriptor.IndexName)
+                    .Query(q => q.Bool(b => new BoolQuery { Filter = filters }))
+                    .Script(s => s
+                        .Source(string.Join("; ", scriptParts))
+                        .Params(scriptParams!)
+                    )
+                    .Refresh();
+
+                if (!string.IsNullOrEmpty(partitionKey))
+                {
+                    u = u.Routing(partitionKey);
+                }
+
+                return u;
+            }, cancellationToken);
+
+            return response.Updated;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to execute UpdateByQuery on ({@Index})", indexDescriptor.IndexName);
+            throw;
+        }
+    }
+
     private QueryContainer ConstructSearchQuery<T>(QueryContainerDescriptor<T> searchDescriptor, ProjectionQuery projectionQuery) where T : class
     {
         // construct search query

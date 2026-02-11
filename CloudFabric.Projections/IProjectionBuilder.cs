@@ -9,6 +9,10 @@ public interface IProjectionBuilder
     Task ApplyEvent(IEvent @event);
 
     Task ApplyEvents(List<IEvent> events);
+
+    Task ApplyCrossAggregateEvent(ICrossAggregateEvent @event);
+
+    bool HandlesCrossAggregateEvent(Type eventType);
 }
 
 public interface IProjectionBuilder<TProjectionDocument> : IProjectionBuilder

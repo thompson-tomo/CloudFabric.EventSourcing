@@ -123,9 +123,31 @@ public abstract class ProjectionRepository : IProjectionRepository
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
     );
     public abstract Task DeleteAll(
-        string? partitionKey = null, 
+        string? partitionKey = null,
         CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
+    );
+
+    public async Task<long> UpdateByQuery(
+        ProjectionQuery query,
+        string? partitionKey,
+        Dictionary<string, object?> propertyUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default,
+        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
+    )
+    {
+        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
+        return await UpdateByQueryInternal(indexDescriptor, query, partitionKey, propertyUpdates, updatedAt, cancellationToken);
+    }
+
+    protected abstract Task<long> UpdateByQueryInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        ProjectionQuery query,
+        string? partitionKey,
+        Dictionary<string, object?> propertyUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
     );
 
     protected async Task<IReadOnlyCollection<ProjectionIndexState>> QueryProjectionIndexStates(

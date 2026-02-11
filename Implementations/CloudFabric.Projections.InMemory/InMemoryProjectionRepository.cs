@@ -292,4 +292,43 @@ public class InMemoryProjectionRepository : ProjectionRepository
                 .ToList()
         });
     }
+
+    protected override Task<long> UpdateByQueryInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        ProjectionQuery query,
+        string? partitionKey,
+        Dictionary<string, object?> propertyUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (!_storage.TryGetValue(indexDescriptor.IndexName, out var storage))
+        {
+            return Task.FromResult(0L);
+        }
+
+        var documents = storage
+            .Where(x => string.IsNullOrEmpty(partitionKey) || x.Key.PartitionKey == partitionKey)
+            .Select(x => x.Value)
+            .AsEnumerable();
+
+        var expression = query.FiltersToExpression<Dictionary<string, object?>>();
+        if (expression != null)
+        {
+            documents = documents.Where(expression.Compile());
+        }
+
+        var materialized = documents.ToList();
+
+        foreach (var doc in materialized)
+        {
+            foreach (var (key, value) in propertyUpdates)
+            {
+                doc[key] = value;
+            }
+            doc[nameof(ProjectionDocument.UpdatedAt)] = updatedAt;
+        }
+
+        return Task.FromResult((long)materialized.Count);
+    }
 }

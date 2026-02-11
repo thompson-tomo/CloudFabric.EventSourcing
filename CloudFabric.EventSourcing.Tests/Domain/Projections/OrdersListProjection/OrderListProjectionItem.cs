@@ -17,4 +17,7 @@ public class OrderListProjectionItem : ProjectionDocument
 
     [ProjectionDocumentProperty(IsNestedObject = true)]
     public OrderListProjectionUserInfo CreatedBy { get; set; }
+
+    [ProjectionDocumentProperty(IsFilterable = true)]
+    public string Tag { get; set; } = string.Empty;
 }

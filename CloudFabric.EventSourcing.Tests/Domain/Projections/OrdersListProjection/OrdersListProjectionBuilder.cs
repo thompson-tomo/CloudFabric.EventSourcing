@@ -1,5 +1,6 @@
 using CloudFabric.EventSourcing.Tests.Domain.Events;
 using CloudFabric.Projections;
+using CloudFabric.Projections.Queries;
 
 namespace CloudFabric.EventSourcing.Tests.Domain.Projections.OrdersListProjection;
 
@@ -7,7 +8,8 @@ public class OrdersListProjectionBuilder : ProjectionBuilder<OrderListProjection
     IHandleEvent<OrderPlaced>,
     IHandleEvent<OrderItemAdded>,
     IHandleEvent<OrderItemRemoved>,
-    IHandleEvent<AggregateUpdatedEvent<Order>>
+    IHandleEvent<AggregateUpdatedEvent<Order>>,
+    IHandleCrossAggregateEvent<BulkOrderTagChanged>
 {
     public OrdersListProjectionBuilder(
         ProjectionRepositoryFactory projectionRepositoryFactory, 
@@ -83,5 +85,15 @@ public class OrdersListProjectionBuilder : ProjectionBuilder<OrderListProjection
     public async Task On(AggregateUpdatedEvent<Order> evt)
     {
         await SetDocumentUpdatedAt(evt.AggregateId, evt.PartitionKey, evt.UpdatedAt);
+    }
+
+    public async Task OnBulk(BulkOrderTagChanged evt)
+    {
+        await UpdateByQuery(
+            new ProjectionQuery(),
+            evt.PartitionKey,
+            new Dictionary<string, object?> { { "Tag", evt.NewTag } },
+            evt.Timestamp
+        );
     }
 }

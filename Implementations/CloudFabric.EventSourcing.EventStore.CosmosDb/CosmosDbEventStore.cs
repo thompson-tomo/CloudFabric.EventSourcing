@@ -396,4 +396,22 @@ public class CosmosDbEventStore : IEventStore
             ContinuationToken = null // CosmosDb change feed handles its own pagination
         };
     }
+
+    public Task<bool> AppendGlobalEventAsync(
+        EventUserInfo eventUserInfo,
+        ICrossAggregateEvent @event,
+        CancellationToken cancellationToken = default
+    )
+    {
+        throw new NotImplementedException("Cross-aggregate events are not yet supported for CosmosDb backend.");
+    }
+
+    public Task<List<IEvent>> LoadGlobalEventsAsync(
+        string aggregateType,
+        string? partitionKey,
+        CancellationToken cancellationToken = default
+    )
+    {
+        throw new NotImplementedException("Cross-aggregate events are not yet supported for CosmosDb backend.");
+    }
 }

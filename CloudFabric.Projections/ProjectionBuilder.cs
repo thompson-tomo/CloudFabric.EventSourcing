@@ -11,6 +11,8 @@ public abstract class ProjectionBuilderBase : IProjectionBuilder
     protected readonly ProjectionRepositoryFactory ProjectionRepositoryFactory;
     public HashSet<Type> HandledEventTypes { get; }
 
+    private readonly HashSet<Type> _crossAggregateEventTypes;
+
     protected ProjectionBuilderBase(
         ProjectionRepositoryFactory projectionRepositoryFactory,
         ProjectionOperationIndexSelector indexSelector
@@ -33,6 +35,22 @@ public abstract class ProjectionBuilderBase : IProjectionBuilder
             );
 
         HandledEventTypes = new HashSet<Type>(interfaces.Select(x => x.GenericTypeArguments.First()));
+
+        var crossInterfaces = GetType()
+            .FindInterfaces(
+                new TypeFilter(
+                    (type, _) =>
+                        type.IsGenericType && typeof(IHandleCrossAggregateEvent<>).IsAssignableFrom(type.GetGenericTypeDefinition())
+                ),
+                null
+            );
+
+        _crossAggregateEventTypes = new HashSet<Type>(crossInterfaces.Select(x => x.GenericTypeArguments.First()));
+
+        foreach (var eventType in _crossAggregateEventTypes)
+        {
+            HandledEventTypes.Add(eventType);
+        }
 
         ProjectionRepositoryFactory = projectionRepositoryFactory;
     }
@@ -60,6 +78,28 @@ public abstract class ProjectionBuilderBase : IProjectionBuilder
         {
             await ApplyEvent(e);
         }
+    }
+
+    public async Task ApplyCrossAggregateEvent(ICrossAggregateEvent @event)
+    {
+        try
+        {
+            await ((dynamic)this).OnBulk((dynamic)@event);
+        }
+        catch (RuntimeBinderException ex)
+        {
+            throw new InvalidOperationException(
+                $"Builder {GetType().Name} does not implement OnBulk({@event.GetType().Name}), " +
+                $"but declares IHandleCrossAggregateEvent<{@event.GetType().Name}>. " +
+                $"Add a public Task OnBulk({@event.GetType().Name} @event) method.",
+                ex
+            );
+        }
+    }
+
+    public bool HandlesCrossAggregateEvent(Type eventType)
+    {
+        return _crossAggregateEventTypes.Contains(eventType);
     }
 }
 
@@ -186,6 +226,20 @@ public class ProjectionBuilder : ProjectionBuilderBase
 
         return repository.Delete(id, partitionKey, cancellationToken, IndexSelector);
     }
+
+    protected Task<long> UpdateByQuery(
+        ProjectionDocumentSchema projectionDocumentSchema,
+        ProjectionQuery query,
+        string? partitionKey,
+        Dictionary<string, object?> propertyUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
+    )
+    {
+        return ProjectionRepositoryFactory
+            .GetProjectionRepository(projectionDocumentSchema)
+            .UpdateByQuery(query, partitionKey, propertyUpdates, updatedAt, cancellationToken, IndexSelector);
+    }
 }
 
 public class ProjectionBuilder<TDocument> : ProjectionBuilderBase, IProjectionBuilder<ProjectionDocument>
@@ -304,5 +358,18 @@ public class ProjectionBuilder<TDocument> : ProjectionBuilderBase, IProjectionBu
         return ProjectionRepositoryFactory
             .GetProjectionRepository<TDocument>()
             .Delete(id, partitionKey, cancellationToken, IndexSelector);
+    }
+
+    protected Task<long> UpdateByQuery(
+        ProjectionQuery query,
+        string? partitionKey,
+        Dictionary<string, object?> propertyUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
+    )
+    {
+        return ProjectionRepositoryFactory
+            .GetProjectionRepository<TDocument>()
+            .UpdateByQuery(query, partitionKey, propertyUpdates, updatedAt, cancellationToken, IndexSelector);
     }
 }

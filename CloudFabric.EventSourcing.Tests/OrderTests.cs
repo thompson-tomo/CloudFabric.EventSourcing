@@ -2,6 +2,7 @@ using CloudFabric.EventSourcing.Domain;
 using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.EventStore.Persistence;
 using CloudFabric.EventSourcing.Tests.Domain;
+using CloudFabric.EventSourcing.Tests.Domain.Events;
 using CloudFabric.EventSourcing.Tests.Domain.Projections.OrdersListProjection;
 using CloudFabric.EventSourcing.Tests.Domain.ValueObjects;
 using CloudFabric.Projections;
@@ -687,11 +688,189 @@ public abstract class OrderTests : TestsBaseWithProjections<OrderListProjectionI
         };
         var order = new Order(id, orderName, items, userId, "john@gmail.com");
 
-        await orderRepository.SaveAsync(userInfo, order);        
-        
+        await orderRepository.SaveAsync(userInfo, order);
+
         await orderRepository.HardDeleteAsync(order.Id, order.PartitionKey);
 
         var order2 = await orderRepository.LoadAsync(id, PartitionKeys.GetOrderPartitionKey());
         order2.Should().BeNull();
     }
+
+    #region Cross-Aggregate Event Tests
+
+    [TestMethod]
+    public virtual async Task TestCrossAggregateEvent_AggregateSeesGlobalEvent()
+    {
+        var eventStore = await GetEventStore();
+        var orderRepository = new AggregateRepository<Order>(eventStore);
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Create two orders
+        var order1 = new Order(Guid.NewGuid(), "Order One", new List<OrderItem>(), userId, "john@gmail.com");
+        var order2 = new Order(Guid.NewGuid(), "Order Two", new List<OrderItem>(), userId, "jane@gmail.com");
+
+        await orderRepository.SaveAsync(userInfo, order1);
+        await orderRepository.SaveAsync(userInfo, order2);
+
+        // Verify orders have no tag initially
+        var loaded1 = await orderRepository.LoadAsync(order1.Id, PartitionKeys.GetOrderPartitionKey());
+        loaded1.Should().NotBeNull();
+        loaded1!.Tag.Should().BeEmpty();
+        var versionBefore = loaded1.Version;
+
+        // Append a cross-aggregate event
+        var bulkEvent = new BulkOrderTagChanged(
+            typeof(Order).AssemblyQualifiedName!,
+            "SALE",
+            PartitionKeys.GetOrderPartitionKey()
+        );
+        await eventStore.AppendGlobalEventAsync(userInfo, bulkEvent);
+
+        // Load orders again — they should see the global event
+        var reloaded1 = await orderRepository.LoadAsync(order1.Id, PartitionKeys.GetOrderPartitionKey());
+        var reloaded2 = await orderRepository.LoadAsync(order2.Id, PartitionKeys.GetOrderPartitionKey());
+
+        reloaded1.Should().NotBeNull();
+        reloaded2.Should().NotBeNull();
+
+        reloaded1!.Tag.Should().Be("SALE");
+        reloaded2!.Tag.Should().Be("SALE");
+
+        // Version should NOT have changed (cross-aggregate events don't count)
+        reloaded1.Version.Should().Be(versionBefore);
+        reloaded2.Version.Should().Be(versionBefore);
+    }
+
+    [TestMethod]
+    public virtual async Task TestCrossAggregateEvent_OptimisticConcurrencyNotAffected()
+    {
+        var eventStore = await GetEventStore();
+        var orderRepository = new AggregateRepository<Order>(eventStore);
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Create an order
+        var order = new Order(Guid.NewGuid(), "Concurrency Test Order", new List<OrderItem>(), userId, "john@gmail.com");
+        await orderRepository.SaveAsync(userInfo, order);
+
+        // Append a cross-aggregate event
+        var bulkEvent = new BulkOrderTagChanged(
+            typeof(Order).AssemblyQualifiedName!,
+            "UPDATED",
+            PartitionKeys.GetOrderPartitionKey()
+        );
+        await eventStore.AppendGlobalEventAsync(userInfo, bulkEvent);
+
+        // Load the order (it will see the global event) and make a modification
+        var loaded = await orderRepository.LoadAsync(order.Id, PartitionKeys.GetOrderPartitionKey());
+        loaded.Should().NotBeNull();
+        loaded!.Tag.Should().Be("UPDATED");
+
+        // Saving a new regular event should succeed — version unchanged by cross-aggregate event
+        loaded.AddItem(new OrderItem(DateTime.UtcNow, "NewItem", 10.00m));
+        var saveResult = await orderRepository.SaveAsync(userInfo, loaded);
+        saveResult.Should().BeTrue();
+
+        // Reload and verify both changes are visible
+        var final = await orderRepository.LoadAsync(order.Id, PartitionKeys.GetOrderPartitionKey());
+        final.Should().NotBeNull();
+        final!.Tag.Should().Be("UPDATED");
+        final.Items.Count.Should().Be(1);
+        final.Items[0].Name.Should().Be("NewItem");
+    }
+
+    [TestMethod]
+    public virtual async Task TestCrossAggregateEvent_ProjectionBulkUpdate()
+    {
+        var eventStore = await GetEventStore();
+        var orderRepository = new OrderRepository(eventStore);
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Create two orders
+        var order1 = new Order(Guid.NewGuid(), "Projection Bulk Order 1", new List<OrderItem>(), userId, "john@gmail.com");
+        var order2 = new Order(Guid.NewGuid(), "Projection Bulk Order 2", new List<OrderItem>(), userId, "jane@gmail.com");
+
+        await orderRepository.SaveOrder(userInfo, order1);
+        await orderRepository.SaveOrder(userInfo, order2);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Verify initial state — no tag
+        var proj1 = await ProjectionsRepository.Single(order1.Id, PartitionKeys.GetOrderPartitionKey());
+        var proj2 = await ProjectionsRepository.Single(order2.Id, PartitionKeys.GetOrderPartitionKey());
+        proj1.Should().NotBeNull();
+        proj2.Should().NotBeNull();
+        proj1!.Tag.Should().BeEmpty();
+        proj2!.Tag.Should().BeEmpty();
+
+        // Append a cross-aggregate event (this goes through event store observers → ProjectionsEngine)
+        var bulkEvent = new BulkOrderTagChanged(
+            typeof(Order).AssemblyQualifiedName!,
+            "BULK_UPDATED",
+            PartitionKeys.GetOrderPartitionKey()
+        );
+        await eventStore.AppendGlobalEventAsync(userInfo, bulkEvent);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Verify projections were updated via UpdateByQuery
+        var updatedProj1 = await ProjectionsRepository.Single(order1.Id, PartitionKeys.GetOrderPartitionKey());
+        var updatedProj2 = await ProjectionsRepository.Single(order2.Id, PartitionKeys.GetOrderPartitionKey());
+
+        updatedProj1.Should().NotBeNull();
+        updatedProj2.Should().NotBeNull();
+        updatedProj1!.Tag.Should().Be("BULK_UPDATED");
+        updatedProj2!.Tag.Should().Be("BULK_UPDATED");
+
+        // Names should remain unchanged
+        updatedProj1.Name.Should().Be("Projection Bulk Order 1");
+        updatedProj2.Name.Should().Be("Projection Bulk Order 2");
+    }
+
+    [TestMethod]
+    public virtual async Task TestCrossAggregateEvent_RebuildIncludesGlobalEvents()
+    {
+        var eventStore = await GetEventStore();
+        var orderRepository = new OrderRepository(eventStore);
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Create an order
+        var order = new Order(Guid.NewGuid(), "Rebuild Cross-Agg Order", new List<OrderItem>(), userId, "john@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order);
+
+        // Append a cross-aggregate event
+        var bulkEvent = new BulkOrderTagChanged(
+            typeof(Order).AssemblyQualifiedName!,
+            "REBUILT_TAG",
+            PartitionKeys.GetOrderPartitionKey()
+        );
+        await eventStore.AppendGlobalEventAsync(userInfo, bulkEvent);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Verify initial projection update worked
+        var proj = await ProjectionsRepository.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
+        proj.Should().NotBeNull();
+        proj!.Tag.Should().Be("REBUILT_TAG");
+
+        // Delete projections and rebuild
+        await ProjectionsRepository.DeleteAll();
+        await ProjectionsRepository.EnsureIndex();
+        await ProjectionsRebuildProcessor.RebuildProjectionsThatRequireRebuild();
+
+        // After rebuild, the cross-aggregate event should be replayed
+        var rebuiltProj = await ProjectionsRepository.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
+        rebuiltProj.Should().NotBeNull();
+        rebuiltProj!.Tag.Should().Be("REBUILT_TAG");
+        rebuiltProj.Name.Should().Be("Rebuild Cross-Agg Order");
+    }
+
+    #endregion
 }

@@ -36,7 +36,26 @@ public interface IProjectionRepository
     );
 
     Task DeleteAll(
-        string? partitionKey = null, 
+        string? partitionKey = null,
+        CancellationToken cancellationToken = default,
+        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
+    );
+
+    /// <summary>
+    /// Performs a bulk update on all documents matching the query. This is a server-side operation —
+    /// documents are NOT loaded into memory. Each backend uses its native bulk update mechanism:
+    /// PostgreSQL: UPDATE ... SET ... WHERE ..., ElasticSearch: _update_by_query, InMemory: iterate and update.
+    /// </summary>
+    /// <param name="query">Filter conditions to select documents for update.</param>
+    /// <param name="partitionKey">Partition key to scope the update. Null means all partitions.</param>
+    /// <param name="propertyUpdates">Dictionary of property name to new value mappings.</param>
+    /// <param name="updatedAt">Timestamp to set on updated documents.</param>
+    /// <returns>Number of documents updated.</returns>
+    Task<long> UpdateByQuery(
+        ProjectionQuery query,
+        string? partitionKey,
+        Dictionary<string, object?> propertyUpdates,
+        DateTime updatedAt,
         CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
     );

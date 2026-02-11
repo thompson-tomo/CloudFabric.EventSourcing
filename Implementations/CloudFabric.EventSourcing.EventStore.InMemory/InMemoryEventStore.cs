@@ -331,6 +331,106 @@ public class InMemoryEventStore : IEventStore
         return wrappers;
     }
 
+    public async Task<bool> AppendGlobalEventAsync(
+        EventUserInfo eventUserInfo,
+        ICrossAggregateEvent @event,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var streamId = DeterministicGuid.Create(@event.AggregateType);
+        var partitionKey = @event.TargetPartitionKey ?? CrossAggregateEvent.AllPartitionsKey;
+
+        @event.PartitionKey = partitionKey;
+
+        lock (_lock)
+        {
+            _eventsContainer.TryGetValue((streamId, partitionKey), out var currentStream);
+            var currentVersion = 0;
+            if (currentStream != null && currentStream.Count > 0)
+            {
+                currentVersion = currentStream
+                    .Select(s => JsonSerializer.Deserialize<EventWrapper>(s, EventStoreSerializerOptions.Options)!)
+                    .Max(w => w.StreamInfo.Version);
+            }
+
+            var wrapper = new EventWrapper
+            {
+                Id = Guid.NewGuid(),
+                StreamInfo = new StreamInfo { Id = streamId, Version = currentVersion + 1 },
+                EventType = @event.GetType().AssemblyQualifiedName,
+                EventData = JsonSerializer.SerializeToElement(@event, @event.GetType(), EventStoreSerializerOptions.Options),
+                UserInfo = JsonSerializer.SerializeToElement(eventUserInfo, eventUserInfo.GetType(), EventStoreSerializerOptions.Options)
+            };
+
+            var stream = currentStream ?? new List<string>();
+            stream.Add(JsonSerializer.Serialize(wrapper, EventStoreSerializerOptions.Options));
+            _eventsContainer[(streamId, partitionKey)] = stream;
+        }
+
+        List<Func<IEvent, Task>> handlers;
+        lock (_lock)
+        {
+            handlers = _eventAddedEventHandlers.ToList();
+        }
+
+        foreach (var h in handlers)
+        {
+            await h(@event);
+        }
+
+        return true;
+    }
+
+    public Task<List<IEvent>> LoadGlobalEventsAsync(
+        string aggregateType,
+        string? partitionKey,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var streamId = DeterministicGuid.Create(aggregateType);
+        var events = new List<IEvent>();
+
+        List<(Guid StreamId, string PartitionKey)> matchingKeys;
+
+        if (partitionKey != null)
+        {
+            matchingKeys = _eventsContainer.Keys
+                .Where(k => k.StreamId == streamId &&
+                            (k.PartitionKey == partitionKey || k.PartitionKey == CrossAggregateEvent.AllPartitionsKey))
+                .ToList();
+        }
+        else
+        {
+            matchingKeys = _eventsContainer.Keys
+                .Where(k => k.StreamId == streamId)
+                .ToList();
+        }
+
+        foreach (var key in matchingKeys)
+        {
+            if (!_eventsContainer.TryGetValue(key, out var eventData))
+            {
+                continue;
+            }
+
+            List<string> snapshot;
+            lock (_lock)
+            {
+                snapshot = eventData.ToList();
+            }
+
+            var wrappers = snapshot
+                .Select(data => JsonSerializer.Deserialize<EventWrapper>(data, EventStoreSerializerOptions.Options)!)
+                .ToList();
+
+            events.AddRange(wrappers.Select(w => w.GetEvent()));
+        }
+
+        events.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
+
+        return Task.FromResult(events);
+    }
+
     public ValueTask DisposeAsync()
     {
         return ValueTask.CompletedTask;

@@ -21,6 +21,7 @@ public class Order : AggregateBase
     public override string PartitionKey => PartitionKeys.GetOrderPartitionKey();
 
     public string OrderName { get; private set; } = string.Empty;
+    public string Tag { get; private set; } = string.Empty;
 
     /// <summary>
     /// It should not be possible to modify the collection from outside.
@@ -71,6 +72,12 @@ public class Order : AggregateBase
         items.AddRange(Items.Where(x => x.Name != @event.Item.Name));
         // set to list without item
         Items = items.AsReadOnly();
+        UpdatedAt = @event.Timestamp;
+    }
+
+    public void On(BulkOrderTagChanged @event)
+    {
+        Tag = @event.NewTag;
         UpdatedAt = @event.Timestamp;
     }
 

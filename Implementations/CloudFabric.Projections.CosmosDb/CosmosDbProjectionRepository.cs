@@ -605,4 +605,16 @@ public class CosmosDbProjectionRepository : ProjectionRepository
 
         return newDictionary;
     }
+
+    protected override Task<long> UpdateByQueryInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        ProjectionQuery query,
+        string? partitionKey,
+        Dictionary<string, object?> propertyUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
+    )
+    {
+        throw new NotImplementedException("UpdateByQuery is not yet supported for CosmosDb backend.");
+    }
 }

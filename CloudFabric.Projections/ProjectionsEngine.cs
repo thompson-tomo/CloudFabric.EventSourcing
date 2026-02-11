@@ -54,6 +54,13 @@ public class ProjectionsEngine : IProjectionsEngine
 
     private async Task HandleEvent(IEvent @event)
     {
+        // Cross-aggregate events are routed to OnBulk handlers, not per-document On handlers.
+        if (@event is ICrossAggregateEvent crossEvent)
+        {
+            await HandleCrossAggregateEvent(crossEvent);
+            return;
+        }
+
         var eventType = @event.GetType();
 
         foreach (var projectionBuilder in _projectionBuilders)
@@ -111,6 +118,28 @@ public class ProjectionsEngine : IProjectionsEngine
         }
 
         #endregion
+    }
+
+    private async Task HandleCrossAggregateEvent(ICrossAggregateEvent @event)
+    {
+        var eventType = @event.GetType();
+
+        foreach (var projectionBuilder in _projectionBuilders)
+        {
+            if (!projectionBuilder.HandlesCrossAggregateEvent(eventType))
+            {
+                continue;
+            }
+
+            try
+            {
+                await projectionBuilder.ApplyCrossAggregateEvent(@event);
+            }
+            catch (Exception ex)
+            {
+                await HandleProjectionError(projectionBuilder, @event, ex);
+            }
+        }
     }
 
     private async Task HandleProjectionError(IProjectionBuilder projectionBuilder, IEvent @event, Exception ex)

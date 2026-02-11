@@ -693,6 +693,88 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         }
     }
     
+    protected override async Task<long> UpdateByQueryInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        ProjectionQuery query,
+        string? partitionKey,
+        Dictionary<string, object?> propertyUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
+    )
+    {
+        indexDescriptor.ProjectionDocumentSchema ??= ProjectionDocumentSchema;
+
+        var queryChunk = ConstructConditionFilters(query.Filters, indexDescriptor.ProjectionDocumentSchema);
+
+        if (!string.IsNullOrEmpty(partitionKey))
+        {
+            queryChunk.WhereChunk += string.IsNullOrWhiteSpace(queryChunk.WhereChunk)
+                ? $" {nameof(ProjectionDocument.PartitionKey)} = @partitionKey"
+                : $" AND {nameof(ProjectionDocument.PartitionKey)} = @partitionKey";
+            queryChunk.Parameters.Add(new("partitionKey", partitionKey));
+        }
+
+        // Build SET clause from propertyUpdates
+        var setStatements = new List<string>();
+        var setParameters = new List<NpgsqlParameter>();
+
+        foreach (var (propName, propValue) in propertyUpdates)
+        {
+            var paramName = $"set_{propName}";
+            setStatements.Add($"{propName} = @{paramName}");
+
+            var value = propValue;
+
+            // Handle JSONB serialization for nested objects/arrays
+            var propSchema = indexDescriptor.ProjectionDocumentSchema.Properties
+                .FirstOrDefault(p => p.PropertyName == propName);
+            if (propSchema is { IsNestedObject: true } or { IsNestedArray: true })
+            {
+                value = JsonSerializer.SerializeToDocument(value);
+            }
+
+            setParameters.Add(new(paramName, value ?? DBNull.Value));
+        }
+
+        // Always update UpdatedAt
+        setStatements.Add($"{nameof(ProjectionDocument.UpdatedAt)} = @set_UpdatedAt");
+        setParameters.Add(new("set_UpdatedAt", updatedAt) { NpgsqlDbType = NpgsqlDbType.TimestampTz });
+
+        var sb = new StringBuilder();
+        sb.Append($"UPDATE \"{indexDescriptor.IndexName}\" SET ");
+        sb.Append(string.Join(", ", setStatements));
+
+        if (!string.IsNullOrEmpty(queryChunk.WhereChunk))
+        {
+            sb.Append(" WHERE ");
+            sb.Append(queryChunk.WhereChunk);
+        }
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        try
+        {
+            await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
+            cmd.Parameters.AddRange(queryChunk.Parameters.ToArray());
+            cmd.Parameters.AddRange(setParameters.ToArray());
+
+            return await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+        catch (NpgsqlException ex)
+        {
+            if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+            {
+                throw new InvalidProjectionSchemaException(ex);
+            }
+
+            throw new Exception(
+                $"Something went terribly wrong while executing UpdateByQuery on \"{indexDescriptor.IndexName}\".",
+                ex
+            );
+        }
+    }
+
     private QueryChunk ConstructOneConditionFilter(Filter filter, ProjectionDocumentSchema schema)
     {
         var queryChunk = new QueryChunk();

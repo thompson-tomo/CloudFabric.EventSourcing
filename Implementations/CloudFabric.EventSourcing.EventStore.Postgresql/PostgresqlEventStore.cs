@@ -620,6 +620,188 @@ public class PostgresqlEventStore : IEventStore
         }
     }
 
+    public async Task<bool> AppendGlobalEventAsync(
+        EventUserInfo eventUserInfo,
+        ICrossAggregateEvent @event,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var connectionInformation = ConnectionInformation;
+        var streamId = DeterministicGuid.Create(@event.AggregateType);
+        var partitionKey = @event.TargetPartitionKey ?? CrossAggregateEvent.AllPartitionsKey;
+
+        @event.PartitionKey = partitionKey;
+
+        await using var conn = new NpgsqlConnection(connectionInformation.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var transaction = await conn.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
+
+        // Get current max version for this global stream
+        await using var versionCmd = new NpgsqlCommand(
+            $"SELECT COALESCE(MAX(stream_version), 0) FROM \"{connectionInformation.TableName}\" WHERE stream_id = @streamId AND partition_key = @partitionKey",
+            conn, transaction)
+        {
+            Parameters =
+            {
+                new("streamId", streamId),
+                new("partitionKey", partitionKey)
+            }
+        };
+
+        int nextVersion;
+        try
+        {
+            var currentVersion = await versionCmd.ExecuteScalarAsync(cancellationToken);
+            nextVersion = (currentVersion is int v ? v : 0) + 1;
+        }
+        catch (NpgsqlException ex)
+        {
+            if (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+            {
+                throw new Exception(
+                    "EventStore table not found, please make sure to call Initialize() on event store first.",
+                    ex);
+            }
+            throw;
+        }
+
+        await using var insertCmd = new NpgsqlCommand(
+            $"INSERT INTO \"{connectionInformation.TableName}\" " +
+            $"(id, partition_key, created_at, stream_id, stream_version, event_type, event_data, user_info, eventstore_schema_version) " +
+            $"VALUES (@id, @partition_key, @created_at, @stream_id, @stream_version, @event_type, @event_data, @user_info, @eventstore_schema_version)",
+            conn, transaction)
+        {
+            Parameters =
+            {
+                new("id", Guid.NewGuid()),
+                new("partition_key", partitionKey),
+                new("created_at", @event.Timestamp),
+                new("stream_id", streamId),
+                new("stream_version", nextVersion),
+                new("event_type", @event.GetType().AssemblyQualifiedName),
+                new NpgsqlParameter()
+                {
+                    ParameterName = "event_data",
+                    Value = JsonSerializer.Serialize(@event, @event.GetType(), EventStoreSerializerOptions.Options),
+                    DataTypeName = "jsonb"
+                },
+                new NpgsqlParameter()
+                {
+                    ParameterName = "user_info",
+                    Value = JsonSerializer.Serialize(eventUserInfo, eventUserInfo.GetType(), EventStoreSerializerOptions.Options),
+                    DataTypeName = "jsonb"
+                },
+                new NpgsqlParameter("eventstore_schema_version", EVENTSTORE_TABLE_SCHEMA_VERSION)
+            }
+        };
+
+        try
+        {
+            await insertCmd.ExecuteNonQueryAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
+        {
+            return false;
+        }
+
+        // Notify handlers
+        var handlers = _eventAddedEventHandlers.ToList();
+        foreach (var h in handlers)
+        {
+            await h(@event);
+        }
+
+        return true;
+    }
+
+    public async Task<List<IEvent>> LoadGlobalEventsAsync(
+        string aggregateType,
+        string? partitionKey,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var connectionInformation = ConnectionInformation;
+        var streamId = DeterministicGuid.Create(aggregateType);
+
+        await using var conn = new NpgsqlConnection(connectionInformation.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        string sql;
+        NpgsqlCommand cmd;
+
+        if (partitionKey != null)
+        {
+            sql = $"SELECT id, stream_id, stream_version, event_type, event_data, user_info " +
+                  $"FROM \"{connectionInformation.TableName}\" " +
+                  $"WHERE stream_id = @streamId AND (partition_key = @partitionKey OR partition_key = @allPartitionsKey) " +
+                  $"ORDER BY created_at ASC";
+            cmd = new NpgsqlCommand(sql, conn)
+            {
+                Parameters =
+                {
+                    new("streamId", streamId),
+                    new("partitionKey", partitionKey),
+                    new("allPartitionsKey", CrossAggregateEvent.AllPartitionsKey)
+                }
+            };
+        }
+        else
+        {
+            sql = $"SELECT id, stream_id, stream_version, event_type, event_data, user_info " +
+                  $"FROM \"{connectionInformation.TableName}\" " +
+                  $"WHERE stream_id = @streamId " +
+                  $"ORDER BY created_at ASC";
+            cmd = new NpgsqlCommand(sql, conn)
+            {
+                Parameters =
+                {
+                    new("streamId", streamId)
+                }
+            };
+        }
+
+        await using (cmd)
+        {
+            try
+            {
+                await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+                var events = new List<IEvent>();
+
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    var eventWrapper = new EventWrapper()
+                    {
+                        Id = reader.GetGuid("id"),
+                        StreamInfo = new StreamInfo
+                        {
+                            Id = reader.GetGuid("stream_id"),
+                            Version = reader.GetInt16("stream_version")
+                        },
+                        EventType = reader.GetString("event_type"),
+                        EventData = JsonSerializer.Deserialize<JsonElement>(reader.GetString("event_data")),
+                        UserInfo = JsonSerializer.Deserialize<JsonElement>(reader.GetString("user_info")),
+                    };
+
+                    events.Add(eventWrapper.GetEvent());
+                }
+
+                return events;
+            }
+            catch (NpgsqlException ex)
+            {
+                if (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+                {
+                    throw new Exception(
+                        "EventStore table not found, please make sure to call Initialize() on event store first.",
+                        ex);
+                }
+                throw;
+            }
+        }
+    }
+
     public ValueTask DisposeAsync()
     {
         return ValueTask.CompletedTask;

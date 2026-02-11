@@ -1,4 +1,3 @@
-using System.Text;
 using CloudFabric.EventSourcing.EventStore;
 
 namespace CloudFabric.EventSourcing.Domain;
@@ -51,11 +50,15 @@ public abstract class AggregateBase
 
         var eventsList = events as IList<IEvent> ?? events.ToList();
 
-        // Set identity from event stream metadata before replaying events.
-        // This decouples aggregate identity from event handler side effects.
+        // Set identity from the first regular (non-cross-aggregate) event.
+        // Cross-aggregate events have AggregateId = Guid.Empty and should not define the aggregate's identity.
         if (eventsList.Count > 0)
         {
-            Id = eventsList[0].AggregateId;
+            var firstRegularEvent = eventsList.FirstOrDefault(e => e is not ICrossAggregateEvent);
+            if (firstRegularEvent != null)
+            {
+                Id = firstRegularEvent.AggregateId;
+            }
         }
 
         foreach (var @event in eventsList)
@@ -66,7 +69,13 @@ public abstract class AggregateBase
             }
 
             RaiseEvent(@event);
-            Version += 1;
+
+            // Cross-aggregate events do not contribute to the aggregate's version.
+            // Version is used for optimistic concurrency on the aggregate's own event stream.
+            if (@event is not ICrossAggregateEvent)
+            {
+                Version += 1;
+            }
         }
     }
 
@@ -97,14 +106,7 @@ public abstract class AggregateBase
     /// <returns></returns>
     public static Guid HashStringToGuid(string stringToHash)
     {
-        // Super fast non-cryptographic hash function: 
-        // https://cyan4973.github.io/xxHash/
-        // 128 version is used because that's what Guid uses for it's value
-        var hash = new System.IO.Hashing.XxHash128();
-
-        hash.Append(Encoding.UTF8.GetBytes(stringToHash));
-
-        return new Guid(hash.GetCurrentHash());
+        return DeterministicGuid.Create(stringToHash);
     }
 
     /// <summary>
