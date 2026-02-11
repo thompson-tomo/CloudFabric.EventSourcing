@@ -1,13 +1,18 @@
 using System.Reflection;
 using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.Projections.Queries;
+using Microsoft.CSharp.RuntimeBinder;
 
 namespace CloudFabric.Projections;
 
-public class ProjectionBuilder : IProjectionBuilder
+public abstract class ProjectionBuilderBase : IProjectionBuilder
 {
-    protected ProjectionBuilder(
-        ProjectionRepositoryFactory projectionRepositoryFactory, 
+    protected readonly ProjectionOperationIndexSelector IndexSelector;
+    protected readonly ProjectionRepositoryFactory ProjectionRepositoryFactory;
+    public HashSet<Type> HandledEventTypes { get; }
+
+    protected ProjectionBuilderBase(
+        ProjectionRepositoryFactory projectionRepositoryFactory,
         ProjectionOperationIndexSelector indexSelector
     ) {
         if (indexSelector != ProjectionOperationIndexSelector.Write && indexSelector != ProjectionOperationIndexSelector.ProjectionRebuild)
@@ -32,14 +37,21 @@ public class ProjectionBuilder : IProjectionBuilder
         ProjectionRepositoryFactory = projectionRepositoryFactory;
     }
 
-    private readonly ProjectionOperationIndexSelector IndexSelector;
-
-    protected readonly ProjectionRepositoryFactory ProjectionRepositoryFactory;
-    public HashSet<Type> HandledEventTypes { get; }
-
     public async Task ApplyEvent(IEvent @event)
     {
-        await (this as dynamic).On((dynamic)@event);
+        try
+        {
+            await (this as dynamic).On((dynamic)@event);
+        }
+        catch (RuntimeBinderException ex)
+        {
+            throw new InvalidOperationException(
+                $"Builder {GetType().Name} does not implement On({@event.GetType().Name}), " +
+                $"but declares IHandleEvent<{@event.GetType().Name}>. " +
+                $"Add a public Task On({@event.GetType().Name} @event) method.",
+                ex
+            );
+        }
     }
 
     public async Task ApplyEvents(List<IEvent> events)
@@ -48,6 +60,16 @@ public class ProjectionBuilder : IProjectionBuilder
         {
             await ApplyEvent(e);
         }
+    }
+}
+
+public class ProjectionBuilder : ProjectionBuilderBase
+{
+    protected ProjectionBuilder(
+        ProjectionRepositoryFactory projectionRepositoryFactory,
+        ProjectionOperationIndexSelector indexSelector
+    ) : base(projectionRepositoryFactory, indexSelector)
+    {
     }
 
     protected Task SetDocumentUpdatedAt(ProjectionDocumentSchema projectionDocumentSchema, Guid id, string partitionKey, DateTime updatedAt, Action? documentNotFound = null)
@@ -166,52 +188,14 @@ public class ProjectionBuilder : IProjectionBuilder
     }
 }
 
-public class ProjectionBuilder<TDocument> : IProjectionBuilder<ProjectionDocument>
+public class ProjectionBuilder<TDocument> : ProjectionBuilderBase, IProjectionBuilder<ProjectionDocument>
     where TDocument : ProjectionDocument
 {
     protected ProjectionBuilder(
-        ProjectionRepositoryFactory projectionRepositoryFactory, 
+        ProjectionRepositoryFactory projectionRepositoryFactory,
         ProjectionOperationIndexSelector indexSelector
-    ) {
-        if (indexSelector != ProjectionOperationIndexSelector.Write && indexSelector != ProjectionOperationIndexSelector.ProjectionRebuild)
-        {
-            throw new ArgumentException($"For projection builder the only possible values are {nameof(ProjectionOperationIndexSelector.Write)} " +
-                                        $"and {nameof(ProjectionOperationIndexSelector.ProjectionRebuild)}");
-        }
-
-        IndexSelector = indexSelector;
-        
-        var interfaces = GetType()
-            .FindInterfaces(
-                new TypeFilter(
-                    (type, _) =>
-                        type.IsGenericType && typeof(IHandleEvent<>).IsAssignableFrom(type.GetGenericTypeDefinition())
-                ),
-                null
-            );
-
-        HandledEventTypes = new HashSet<Type>(interfaces.Select(x => x.GenericTypeArguments.First()));
-
-        ProjectionRepositoryFactory = projectionRepositoryFactory;
-    }
-
-    private readonly ProjectionOperationIndexSelector IndexSelector;
-
-    protected readonly ProjectionRepositoryFactory ProjectionRepositoryFactory;
-
-    public HashSet<Type> HandledEventTypes { get; }
-
-    public async Task ApplyEvent(IEvent @event)
+    ) : base(projectionRepositoryFactory, indexSelector)
     {
-        await (this as dynamic).On((dynamic)@event);
-    }
-
-    public async Task ApplyEvents(List<IEvent> events)
-    {
-        foreach (var e in events)
-        {
-            await ApplyEvent(e);
-        }
     }
 
     protected Task SetDocumentUpdatedAt(Guid id, string partitionKey, DateTime updatedAt, Action? documentNotFound = null)

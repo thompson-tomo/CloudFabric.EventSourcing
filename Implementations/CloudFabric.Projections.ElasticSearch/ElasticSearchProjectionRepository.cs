@@ -224,6 +224,11 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         await _indexer.CreateOrUpdateIndex(indexName, projectionDocumentSchema);
     }
 
+    protected override async Task DropIndex(string indexName, CancellationToken cancellationToken = default)
+    {
+        await _client.Indices.DeleteAsync(new DeleteIndexRequest(indexName), cancellationToken);
+    }
+
     public override async Task<Dictionary<string, object?>?> Single(
         Guid id,
         string partitionKey,

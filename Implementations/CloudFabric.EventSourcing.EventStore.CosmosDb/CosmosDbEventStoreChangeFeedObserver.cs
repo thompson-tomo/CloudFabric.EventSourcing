@@ -86,8 +86,9 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
     }
 
     public override async Task ReplayEventsAsync(
-        string instanceName, 
-        string? partitionKey, 
+        Func<IEvent, Task> eventHandler,
+        string instanceName,
+        string? partitionKey,
         DateTime? dateFrom,
         int chunkSize = 250,
         Func<int, IEvent, Task>? chunkProcessedCallback = null,
@@ -98,15 +99,15 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
             instanceName,
             dateFrom
         );
-        
+
         Container eventContainer = _eventsClient.GetContainer(_eventsDatabaseId, _eventsContainerId);
-        
+
         DateTime endTime = DateTime.UtcNow;
 
         using var feedIterator = eventContainer
             .GetChangeFeedIterator<Change>(
-                dateFrom.HasValue 
-                    ? ChangeFeedStartFrom.Time(dateFrom.Value, FeedRange.FromPartitionKey(new PartitionKey(partitionKey))) 
+                dateFrom.HasValue
+                    ? ChangeFeedStartFrom.Time(dateFrom.Value, FeedRange.FromPartitionKey(new PartitionKey(partitionKey)))
                     : ChangeFeedStartFrom.Beginning(FeedRange.FromPartitionKey(new PartitionKey(partitionKey))),
                 ChangeFeedMode.Incremental,
                 new ChangeFeedRequestOptions
@@ -125,18 +126,21 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
             }
 
             var totalEventsProcessed = 0;
-            
+
             if (response.StatusCode != HttpStatusCode.NotModified)
             {
                 var events = new ReadOnlyCollection<Change>(response.ToList());
                 totalEventsProcessed += events.Count;
-                
-                await HandleChangesAsync(events, CancellationToken.None);
+
+                foreach (var change in events)
+                {
+                    await eventHandler(change.GetEvent());
+                }
 
                 var lastEvent = events.Last().GetEvent();
-                
-                _logger.LogInformation("Replayed {ReplayedEventsCount} {InstanceName}, last event timestamp: {LastEventDateTime}", 
-                    events.Count, 
+
+                _logger.LogInformation("Replayed {ReplayedEventsCount} {InstanceName}, last event timestamp: {LastEventDateTime}",
+                    events.Count,
                     instanceName,
                     lastEvent.Timestamp
                 );
@@ -149,8 +153,8 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
 
             if (cancellationToken.IsCancellationRequested)
             {
-                _logger.LogInformation("Cancellation requested. Processed {TotalEventsProcessed} {InstanceName}", 
-                    totalEventsProcessed, 
+                _logger.LogInformation("Cancellation requested. Processed {TotalEventsProcessed} {InstanceName}",
+                    totalEventsProcessed,
                     instanceName
                 );
 
@@ -164,7 +168,7 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
         return await _eventStore.GetStatistics();
     }
 
-    public override async Task ReplayEventsForOneDocumentAsync(Guid documentId, string partitionKey)
+    public override async Task ReplayEventsForOneDocumentAsync(Func<IEvent, Task> eventHandler, Guid documentId, string partitionKey)
     {
         Container eventContainer = _eventsClient.GetContainer(_eventsDatabaseId, _eventsContainerId);
 
@@ -185,7 +189,7 @@ public class CosmosDbEventStoreChangeFeedObserver : EventsObserver
             foreach (var eventWrapper in response)
             {
                 var @event = eventWrapper.GetEvent();
-                await EventStoreOnEventAdded(@event);
+                await eventHandler(@event);
             }
         }
     }

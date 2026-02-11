@@ -1,12 +1,10 @@
 using System.Collections.Concurrent;
 using CloudFabric.EventSourcing.EventStore;
-using CloudFabric.EventSourcing.Domain;
 using CloudFabric.EventSourcing.EventStore.InMemory;
 using CloudFabric.Projections;
 using CloudFabric.Projections.InMemory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 using IMetadataRepository = CloudFabric.EventSourcing.EventStore.IMetadataRepository;
 
 namespace CloudFabric.EventSourcing.AspNet.InMemory.Extensions
@@ -36,28 +34,21 @@ namespace CloudFabric.EventSourcing.AspNet.InMemory.Extensions
 
                     var projectionsRepositoryFactory = sp.GetService<ProjectionRepositoryFactory>();
 
-                    // Postgresql's event observer is synchronous - it just handles all calls to npgsql commands, there is no delay
-                    // or log processing. That means that all events are happening in request context, possibly on multiple threads,
-                    // so having one global projections builder is more complicated than simply creating new projections builder for each request.
-                    if (projectionsRepositoryFactory != null)
+                    if (projectionsRepositoryFactory != null && builder.ProjectionBuilderFactories != null)
                     {
-                        var projectionsEngine = new ProjectionsEngine();
-                        projectionsEngine.SetEventsObserver(eventStoreObserver);
+                        var projectionsEngine = new ProjectionsEngine(eventStoreObserver);
 
-                        foreach (var projectionBuilderType in builder.ProjectionBuilderTypes)
+                        foreach (var factory in builder.ProjectionBuilderFactories)
                         {
-                            var projectionBuilder = builder.ConstructProjectionBuilder(
-                                projectionBuilderType, 
-                                projectionsRepositoryFactory, 
-                                new AggregateRepositoryFactory(eventStore), 
-                                sp, 
+                            var projectionBuilder = factory(
+                                projectionsRepositoryFactory,
                                 ProjectionOperationIndexSelector.Write
                             );
 
                             projectionsEngine.AddProjectionBuilder(projectionBuilder);
                         }
 
-                        projectionsEngine.Start("");
+                        // No explicit StartAsync needed - InMemory observer subscribes in constructor
                     }
 
                     return eventStore;
@@ -93,15 +84,16 @@ namespace CloudFabric.EventSourcing.AspNet.InMemory.Extensions
 
         public static IEventSourcingBuilder AddInMemoryProjections(
             this IEventSourcingBuilder builder,
-            params Type[] projectionBuildersTypes
+            params ProjectionBuilderFactory[] projectionBuilderFactories
         )
         {
-            builder.ProjectionBuilderTypes = projectionBuildersTypes;
+            var b = (EventSourcingBuilder)builder;
+            b.ProjectionBuilderFactories = projectionBuilderFactories;
 
             builder.Services.AddScoped<ProjectionRepositoryFactory>((sp) =>
             {
                 var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-                return new InMemoryProjectionRepositoryFactory(loggerFactory); 
+                return new InMemoryProjectionRepositoryFactory(loggerFactory);
             });
 
             return builder;

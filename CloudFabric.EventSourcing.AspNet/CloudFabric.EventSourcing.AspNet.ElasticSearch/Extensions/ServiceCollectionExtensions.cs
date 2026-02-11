@@ -12,10 +12,11 @@ namespace CloudFabric.EventSourcing.AspNet.ElasticSearch.Extensions
             ElasticSearchBasicAuthConnectionSettings basicAuthConnectionSettings,
             ILoggerFactory loggerFactory,
             bool disableRequestStreaming = false,
-            params Type[] projectionBuildersTypes
+            params ProjectionBuilderFactory[] projectionBuilderFactories
         )
         {
-            builder.ProjectionBuilderTypes = projectionBuildersTypes;
+            var b = (EventSourcingBuilder)builder;
+            b.ProjectionBuilderFactories = projectionBuilderFactories;
 
             builder.Services.AddScoped<ProjectionRepositoryFactory>(
                 (sp) => new ElasticSearchProjectionRepositoryFactory(
@@ -33,10 +34,11 @@ namespace CloudFabric.EventSourcing.AspNet.ElasticSearch.Extensions
             ElasticSearchApiKeyAuthConnectionSettings apiKeyAuthConnectionSettings,
             ILoggerFactory loggerFactory,
             bool disableRequestStreaming = false,
-            params Type[] projectionBuildersTypes
+            params ProjectionBuilderFactory[] projectionBuilderFactories
         )
         {
-            builder.ProjectionBuilderTypes = projectionBuildersTypes;
+            var b = (EventSourcingBuilder)builder;
+            b.ProjectionBuilderFactories = projectionBuilderFactories;
 
             builder.Services.AddScoped<ProjectionRepositoryFactory>(
                 (sp) => new ElasticSearchProjectionRepositoryFactory(

@@ -161,15 +161,14 @@ public abstract class DynamicProjectionSchemaTests
             .GetProjectionRepository(schema);
 
         // Projections engine - takes events from events observer and passes them to multiple projection builders
-        var projectionsEngine = new ProjectionsEngine();
-        projectionsEngine.SetEventsObserver(eventsObserver);
+        var projectionsEngine = new ProjectionsEngine(eventsObserver);
 
         var ordersListProjectionBuilder = new OrderListsDynamicProjectionBuilder(
             GetProjectionRepositoryFactory(),
             schema
         );
         projectionsEngine.AddProjectionBuilder(ordersListProjectionBuilder);
-        
+
         await projectionsEngine.StartAsync("TestInstance");
 
         return (projectionsEngine, ordersListProjectionsRepository);
@@ -181,7 +180,7 @@ public abstract class DynamicProjectionSchemaTests
             GetProjectionRepositoryFactory().GetProjectionsIndexStateRepository(),
             async (string connectionId) =>
             {
-                var projectionsEngine = new ProjectionsEngine();
+                var projectionsEngine = new ProjectionsEngine(eventsObserver);
 
                 var ordersListProjectionBuilder = new OrderListsDynamicProjectionBuilder(
                     GetProjectionRepositoryFactory(),
@@ -189,8 +188,6 @@ public abstract class DynamicProjectionSchemaTests
                     ProjectionOperationIndexSelector.ProjectionRebuild
                 );
                 projectionsEngine.AddProjectionBuilder(ordersListProjectionBuilder);
-        
-                projectionsEngine.SetEventsObserver(eventsObserver);
 
                 // no need to listen - we are attaching this projections engine to test event store which is already being observed
                 // by tests projections engine (see PrepareProjections method)

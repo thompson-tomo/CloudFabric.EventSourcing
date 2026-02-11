@@ -76,12 +76,14 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
         public static IEventSourcingBuilder AddRepository<TRepo>(this IEventSourcingBuilder builder)
             where TRepo : class
         {
-            if (builder.EventStore == null)
+            var b = (EventSourcingBuilder)builder;
+
+            if (b.EventStore == null)
             {
                 throw new ArgumentException("Event store is missing");
             }
 
-            builder.Services.AddSingleton(sp => ActivatorUtilities.CreateInstance<TRepo>(sp, new object[] { builder.EventStore }));
+            builder.Services.AddSingleton(sp => ActivatorUtilities.CreateInstance<TRepo>(sp, new object[] { b.EventStore }));
             return builder;
         }
 
@@ -89,10 +91,11 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
         public static IEventSourcingBuilder AddCosmosDbProjections(
             this IEventSourcingBuilder builder,
             CosmosProjectionRepositoryConnectionInfo projectionsConnectionInfo,
-            params Type[] projectionBuildersTypes
+            params ProjectionBuilderFactory[] projectionBuilderFactories
         )
         {
-            builder.ProjectionBuilderTypes = projectionBuildersTypes;
+            var b = (EventSourcingBuilder)builder;
+            b.ProjectionBuilderFactories = projectionBuilderFactories;
 
             var projectionsRepositoryFactory = new CosmosDbProjectionRepositoryFactory(
                 projectionsConnectionInfo.LoggerFactory,
@@ -108,18 +111,13 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
             // so ProjectionsEngine is singleton (unlike PostgreSQL's per-request pattern).
             builder.Services.AddSingleton<ProjectionsEngine>(sp =>
             {
-                var projectionsEngine = new ProjectionsEngine();
-
                 var changeFeedObserver = sp.GetRequiredService<CosmosDbEventStoreChangeFeedObserver>();
-                projectionsEngine.SetEventsObserver(changeFeedObserver);
+                var projectionsEngine = new ProjectionsEngine(changeFeedObserver);
 
-                foreach (var projectionBuilderType in projectionBuildersTypes)
+                foreach (var factory in projectionBuilderFactories)
                 {
-                    var projectionBuilder = builder.ConstructProjectionBuilder(
-                        projectionBuilderType,
+                    var projectionBuilder = factory(
                         projectionsRepositoryFactory,
-                        new AggregateRepositoryFactory(builder.EventStore),
-                        sp,
                         ProjectionOperationIndexSelector.Write
                     );
 

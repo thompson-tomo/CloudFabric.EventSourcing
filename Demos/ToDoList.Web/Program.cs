@@ -42,9 +42,9 @@ var eventSourcingBuilder = builder.Services
     .AddPostgresqlProjections(
         builder.Configuration.GetConnectionString("Default"),
         true,
-        typeof(UserAccountsProjectionBuilder),
-        typeof(TasksProjectionBuilder),
-        typeof(TaskListsProjectionBuilder)
+        (factory, selector) => new UserAccountsProjectionBuilder(factory, selector),
+        (factory, selector) => new TasksProjectionBuilder(factory, selector),
+        (factory, selector) => new TaskListsProjectionBuilder(factory, selector)
     )
     .AddProjectionsRebuildProcessor();
 

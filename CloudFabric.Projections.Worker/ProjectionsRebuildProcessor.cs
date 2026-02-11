@@ -6,7 +6,7 @@ namespace CloudFabric.Projections.Worker;
 public class ProjectionsRebuildProcessor
 {
     private readonly ProjectionRepository _projectionRepository;
-    private readonly Func<string, Task<ProjectionsEngine>> _projectionsEngineFactory;
+    private readonly Func<string, Task<IProjectionsEngine>> _projectionsEngineFactory;
 
     private readonly ILogger<ProjectionsRebuildProcessor> _logger;
     
@@ -17,7 +17,7 @@ public class ProjectionsRebuildProcessor
     /// <param name="logger"></param>
     public ProjectionsRebuildProcessor(
         ProjectionRepository projectionRepository,
-        Func<string, Task<ProjectionsEngine>> projectionsEngineFactory,
+        Func<string, Task<IProjectionsEngine>> projectionsEngineFactory,
         ILogger<ProjectionsRebuildProcessor> logger
     ) {
         _projectionRepository = projectionRepository;
@@ -25,7 +25,12 @@ public class ProjectionsRebuildProcessor
         _logger = logger;
     }
 
-    public async Task RebuildProjectionsThatRequireRebuild(int maxParallelTasks = 4, int maxIterations = 100, CancellationToken cancellationToken = default)
+    public async Task RebuildProjectionsThatRequireRebuild(
+        int maxParallelTasks = 4,
+        int maxIterations = 100,
+        TimeSpan? staleIndexGracePeriod = null,
+        CancellationToken cancellationToken = default
+    )
     {
         for (var iteration = 0; iteration < maxIterations && !cancellationToken.IsCancellationRequested; iteration++)
         {
@@ -52,6 +57,12 @@ public class ProjectionsRebuildProcessor
 
             if (tasks.Count <= 0)
             {
+                // No more projections to rebuild — clean up stale indices if configured
+                if (staleIndexGracePeriod.HasValue)
+                {
+                    await CleanupStaleIndicesAsync(staleIndexGracePeriod.Value, cancellationToken);
+                }
+
                 return;
             }
 
@@ -66,6 +77,18 @@ public class ProjectionsRebuildProcessor
         }
     }
 
+    public async Task<int> CleanupStaleIndicesAsync(TimeSpan gracePeriod, CancellationToken cancellationToken = default)
+    {
+        var droppedCount = await _projectionRepository.CleanupStaleIndicesAsync(gracePeriod, cancellationToken);
+
+        if (droppedCount > 0)
+        {
+            _logger.LogInformation("Cleaned up {Count} stale projection indices", droppedCount);
+        }
+
+        return droppedCount;
+    }
+
     public async Task<bool> RebuildOneProjectionWhichRequiresRebuild(
         ProjectionIndexState projectionIndexState, 
         string indexNameToRebuild, 
@@ -75,7 +98,7 @@ public class ProjectionsRebuildProcessor
         {
             var connectionId = projectionIndexState.ConnectionId;
 
-            var projectionsEngine = await _projectionsEngineFactory(connectionId);
+            await using var projectionsEngine = await _projectionsEngineFactory(connectionId);
 
             var eventStoreStatistics = await projectionsEngine.GetEventStoreStatistics();
 

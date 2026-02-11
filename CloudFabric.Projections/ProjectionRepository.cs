@@ -66,6 +66,11 @@ public abstract class ProjectionRepository : IProjectionRepository
     }
     
     protected abstract Task CreateIndex(string indexName, ProjectionDocumentSchema projectionDocumentSchema);
+
+    /// <summary>
+    /// Drops a specific index by name. Used by stale index cleanup after projection rebuild completes.
+    /// </summary>
+    protected abstract Task DropIndex(string indexName, CancellationToken cancellationToken = default);
     
     public abstract Task<Dictionary<string, object?>?> Single(
         Guid id, 
@@ -372,6 +377,61 @@ public abstract class ProjectionRepository : IProjectionRepository
         }
     }
     
+    /// <summary>
+    /// Removes stale indices that completed rebuild more than <paramref name="gracePeriod"/> ago,
+    /// keeping only the most recent completed index per projection.
+    /// </summary>
+    public async Task<int> CleanupStaleIndicesAsync(TimeSpan gracePeriod, CancellationToken cancellationToken = default)
+    {
+        var allStates = await QueryProjectionIndexStates(new Queries.ProjectionQuery(), cancellationToken);
+        var droppedCount = 0;
+
+        foreach (var state in allStates)
+        {
+            var completedIndices = state.IndexesStatuses
+                .Where(i => i.RebuildCompletedAt != null)
+                .OrderByDescending(i => i.RebuildCompletedAt)
+                .ToList();
+
+            if (completedIndices.Count <= 1)
+            {
+                continue;
+            }
+
+            // Keep the most recent completed index, remove old ones past grace period
+            var threshold = DateTime.UtcNow - gracePeriod;
+            var staleIndices = completedIndices
+                .Skip(1) // keep the newest
+                .Where(i => i.RebuildCompletedAt < threshold)
+                .ToList();
+
+            foreach (var staleIndex in staleIndices)
+            {
+                try
+                {
+                    await DropIndex(staleIndex.IndexName, cancellationToken);
+                    state.IndexesStatuses.Remove(staleIndex);
+                    droppedCount++;
+                    Logger.LogInformation(
+                        "Dropped stale index {IndexName} for projection {ProjectionName} (completed at {CompletedAt})",
+                        staleIndex.IndexName, state.ProjectionName, staleIndex.RebuildCompletedAt
+                    );
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError(ex, "Failed to drop stale index {IndexName}", staleIndex.IndexName);
+                }
+            }
+
+            if (staleIndices.Count > 0)
+            {
+                await SaveProjectionIndexState(state);
+            }
+        }
+
+        return droppedCount;
+    }
+
     public async Task<(ProjectionIndexState?, string?)> AcquireAndLockProjectionThatRequiresRebuild()
     {
         // we need to round datetime received from the database because postgresql has less precision than dotnet

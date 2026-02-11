@@ -11,11 +11,7 @@ public interface IProjectionBuilder
     Task ApplyEvents(List<IEvent> events);
 }
 
-public interface IProjectionBuilder<TProjectionDocument> where TProjectionDocument : ProjectionDocument
+public interface IProjectionBuilder<TProjectionDocument> : IProjectionBuilder
+    where TProjectionDocument : ProjectionDocument
 {
-    public HashSet<Type> HandledEventTypes { get; }
-
-    Task ApplyEvent(IEvent @event);
-
-    Task ApplyEvents(List<IEvent> events);
 }

@@ -99,6 +99,12 @@ public class InMemoryProjectionRepository : ProjectionRepository
         return Task.CompletedTask;
     }
 
+    protected override Task DropIndex(string indexName, CancellationToken cancellationToken = default)
+    {
+        _storage.TryRemove(indexName, out _);
+        return Task.CompletedTask;
+    }
+
     public override async Task<Dictionary<string, object?>?> Single(
         Guid id,
         string partitionKey,

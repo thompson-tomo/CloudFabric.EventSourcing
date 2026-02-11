@@ -6,6 +6,7 @@ namespace CloudFabric.EventSourcing.EventStore.Postgresql;
 public class PostgresqlEventStoreEventObserver : EventsObserver
 {
     private new readonly PostgresqlEventStore _eventStore;
+    private bool _subscribed;
 
     public PostgresqlEventStoreEventObserver(
         PostgresqlEventStore eventStore,
@@ -13,14 +14,20 @@ public class PostgresqlEventStoreEventObserver : EventsObserver
     ): base(eventStore, logger)
     {
         _eventStore = eventStore;
+        _eventStore.SubscribeToEventAdded(EventStoreOnEventAdded);
+        _subscribed = true;
     }
 
-    
     public override Task StartAsync(string instanceName)
     {
         _logger.LogInformation("Starting {InstanceName}", instanceName);
 
-        _eventStore.SubscribeToEventAdded(EventStoreOnEventAdded);
+        if (!_subscribed)
+        {
+            _eventStore.SubscribeToEventAdded(EventStoreOnEventAdded);
+            _subscribed = true;
+        }
+
         return Task.CompletedTask;
     }
 
@@ -28,8 +35,12 @@ public class PostgresqlEventStoreEventObserver : EventsObserver
     {
         _logger.LogInformation("Stopping");
 
-        _eventStore.UnsubscribeFromEventAdded(EventStoreOnEventAdded);
+        if (_subscribed)
+        {
+            _eventStore.UnsubscribeFromEventAdded(EventStoreOnEventAdded);
+            _subscribed = false;
+        }
+
         return Task.CompletedTask;
     }
-    
 }

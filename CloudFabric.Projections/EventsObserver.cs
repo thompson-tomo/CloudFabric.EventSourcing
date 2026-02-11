@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using CloudFabric.EventSourcing.EventStore;
 using Microsoft.Extensions.Logging;
 
@@ -5,7 +6,7 @@ namespace CloudFabric.Projections;
 
 public abstract class EventsObserver
 {
-    private Func<IEvent, Task>? _eventHandler;
+    private ImmutableList<Func<IEvent, Task>> _eventHandlers = ImmutableList<Func<IEvent, Task>>.Empty;
     protected readonly ILogger<EventsObserver> _logger;
     protected readonly IEventStore _eventStore;
 
@@ -15,22 +16,27 @@ public abstract class EventsObserver
         _logger = logger;
     }
 
-    public void SetEventHandler(Func<IEvent, Task> eventHandler)
+    public void AddEventHandler(Func<IEvent, Task> eventHandler)
     {
-        Volatile.Write(ref _eventHandler, eventHandler);
+        ImmutableInterlocked.Update(ref _eventHandlers, list => list.Add(eventHandler));
+    }
+
+    public void RemoveEventHandler(Func<IEvent, Task> eventHandler)
+    {
+        ImmutableInterlocked.Update(ref _eventHandlers, list => list.Remove(eventHandler));
     }
 
     public abstract Task StartAsync(string instanceName);
 
     public abstract Task StopAsync();
 
-    public virtual async Task ReplayEventsForOneDocumentAsync(Guid documentId, string partitionKey)
+    public virtual async Task ReplayEventsForOneDocumentAsync(Func<IEvent, Task> eventHandler, Guid documentId, string partitionKey)
     {
         var stream = await _eventStore.LoadStreamAsync(documentId, partitionKey);
 
         foreach (var @event in stream.Events)
         {
-            await EventStoreOnEventAdded(@event);
+            await eventHandler(@event);
         }
     }
 
@@ -51,6 +57,7 @@ public abstract class EventsObserver
     /// <param name="cancellationToken">This is a long-running operation, so make sure to pass correct CancellationToken here.</param>
     /// <returns></returns>
     public virtual async Task ReplayEventsAsync(
+        Func<IEvent, Task> eventHandler,
         string instanceName,
         string? partitionKey,
         DateTime? dateFrom,
@@ -96,7 +103,7 @@ public abstract class EventsObserver
 
             foreach (var @event in result.Events)
             {
-                await EventStoreOnEventAdded(@event);
+                await eventHandler(@event);
             }
 
             applyEventsWatch.Stop();
@@ -134,14 +141,17 @@ public abstract class EventsObserver
 
     protected async Task EventStoreOnEventAdded(IEvent e)
     {
-        var handler = Volatile.Read(ref _eventHandler);
+        var handlers = Volatile.Read(ref _eventHandlers);
 
-        if (handler == null)
+        if (handlers.IsEmpty)
         {
             throw new InvalidOperationException(
-                "Can't process an event: no eventHandler was set. Please call SetEventHandler before calling StartAsync.");
+                "Can't process an event: no event handlers registered. Please call AddEventHandler before calling StartAsync.");
         }
 
-        await handler(e);
+        foreach (var handler in handlers)
+        {
+            await handler(e);
+        }
     }
 }

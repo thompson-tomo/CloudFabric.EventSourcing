@@ -133,6 +133,13 @@ public class CosmosDbProjectionRepository : ProjectionRepository
         return Task.CompletedTask;
     }
 
+    protected override async Task DropIndex(string indexName, CancellationToken cancellationToken = default)
+    {
+        // CosmosDb uses containers, not named indices — dropping a specific index is a no-op.
+        // Full cleanup is handled by DeleteAll which deletes the container.
+        await Task.CompletedTask;
+    }
+
     public override async Task<Dictionary<string, object?>?> Single(
         Guid id, 
         string partitionKey, 

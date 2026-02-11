@@ -194,9 +194,18 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         }
     }
 
+    protected override async Task DropIndex(string indexName, CancellationToken cancellationToken = default)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new NpgsqlCommand($"DROP TABLE IF EXISTS \"{indexName}\"", conn);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     public override async Task<Dictionary<string, object?>?> Single(
-        Guid id, 
-        string partitionKey, 
+        Guid id,
+        string partitionKey,
         CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.ReadOnly
     ) {

@@ -324,8 +324,7 @@ public abstract class OrderTests : TestsBaseWithProjections<OrderListProjectionI
         var orderRepositoryEventsObserver = GetEventStoreEventsObserver();
 
         // Projections engine - takes events from events observer and passes them to multiple projection builders
-        var projectionsEngine = new ProjectionsEngine();
-        projectionsEngine.SetEventsObserver(orderRepositoryEventsObserver);
+        var projectionsEngine = new ProjectionsEngine(orderRepositoryEventsObserver);
 
         var ordersListProjectionBuilder = new OrdersListProjectionBuilder(GetProjectionRepositoryFactory());
         projectionsEngine.AddProjectionBuilder(ordersListProjectionBuilder);
@@ -618,8 +617,7 @@ public abstract class OrderTests : TestsBaseWithProjections<OrderListProjectionI
         var orderRepositoryEventsObserver = GetEventStoreEventsObserver();
 
         // Projections engine - takes events from events observer and passes them to multiple projection builders
-        var projectionsEngine = new ProjectionsEngine();
-        projectionsEngine.SetEventsObserver(orderRepositoryEventsObserver);
+        var projectionsEngine = new ProjectionsEngine(orderRepositoryEventsObserver);
 
         var ordersListProjectionBuilder = new OrdersListProjectionBuilder(GetProjectionRepositoryFactory());
         projectionsEngine.AddProjectionBuilder(ordersListProjectionBuilder);
