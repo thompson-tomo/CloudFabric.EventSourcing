@@ -56,6 +56,7 @@ namespace CloudFabric.EventSourcing.AspNet.InMemory.Extensions
             );
 
             services.AddScoped<IMetadataRepository>(sp => new InMemoryMetadataRepository(itemsContainer));
+            services.AddScoped<ISequenceGenerator>(sp => new InMemorySequenceGenerator());
 
             return builder;
         }

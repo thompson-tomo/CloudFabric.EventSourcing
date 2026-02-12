@@ -17,6 +17,7 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
         public EventsObserver EventsObserver { get; set; }
         public ProjectionsEngine? ProjectionsEngine { get; set; }
         public IMetadataRepository MetadataRepository { get; set; }
+        public ISequenceGenerator SequenceGenerator { get; set; }
     }
 
     public static class ServiceCollectionExtensions
@@ -87,6 +88,7 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
                     }
 
                     scope.MetadataRepository = new PostgresqlMetadataRepository(connectionInformationProvider);
+                    scope.SequenceGenerator = new PostgresqlSequenceGenerator(connectionInformationProvider);
 
                     return scope;
                 }
@@ -129,6 +131,16 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
                     var eventSourcingScope = sp.GetRequiredKeyedService<PostgresqlEventSourcingScope>(key);
 
                     return eventSourcingScope.MetadataRepository;
+                }
+            );
+
+            services.AddKeyedScoped<ISequenceGenerator>(
+                eventStoreKey,
+                (sp, key) =>
+                {
+                    var eventSourcingScope = sp.GetRequiredKeyedService<PostgresqlEventSourcingScope>(key);
+
+                    return eventSourcingScope.SequenceGenerator;
                 }
             );
 
