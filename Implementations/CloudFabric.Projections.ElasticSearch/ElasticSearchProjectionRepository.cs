@@ -323,7 +323,7 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
                                     {
                                         Filter = new List<QueryContainer>
                                         {
-                                            new QueryStringQuery() { Query = $"{nameof(partitionKey)}:{partitionKey}" }
+                                            new TermQuery { Field = nameof(partitionKey), Value = partitionKey }
                                         }
                                     }
                                 )
@@ -615,7 +615,7 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
 
             // Build filter query
             var filters = query.Filters != null && query.Filters.Any()
-                ? ElasticSearchFilterFactory.ConstructFilters(query.Filters)
+                ? ElasticSearchFilterFactory.ConstructFilters(query.Filters, _projectionDocumentSchema)
                 : new List<QueryContainer>();
 
             if (!string.IsNullOrEmpty(partitionKey))

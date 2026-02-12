@@ -696,6 +696,221 @@ public abstract class OrderTests : TestsBaseWithProjections<OrderListProjectionI
         order2.Should().BeNull();
     }
 
+    [TestMethod]
+    public virtual async Task TestProjectionsQueryFilterDateTimeGreaterVsGreaterOrEqual()
+    {
+        var orderRepository = new OrderRepository(await GetEventStore());
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Use a fixed boundary date for precision
+        var boundaryDate = new DateTime(2020, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+
+        // Order 1: item exactly at boundary
+        var order1Items = new List<OrderItem>
+        {
+            new OrderItem(boundaryDate, "Boundary Item", 10.00m)
+        };
+        var order1 = new Order(Guid.NewGuid(), "Boundary Order", order1Items, userId, "john@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order1);
+
+        // Order 2: item after boundary
+        var order2Items = new List<OrderItem>
+        {
+            new OrderItem(boundaryDate.AddHours(1), "After Item", 20.00m)
+        };
+        var order2 = new Order(Guid.NewGuid(), "After Order", order2Items, userId, "jane@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order2);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // GreaterOrEqual should include the boundary (both orders have items >= boundaryDate)
+        var queryGte = new ProjectionQuery();
+        queryGte.Filters.Add(new Filter
+        {
+            PropertyName = "Items.AddedAt",
+            Operator = FilterOperator.GreaterOrEqual,
+            Value = boundaryDate
+        });
+
+        var ordersGte = await ProjectionsRepository.Query(queryGte);
+        ordersGte.TotalRecordsFound.Should().Be(2, "GreaterOrEqual should include the boundary value");
+
+        // Greater should exclude the boundary (only order2 has item > boundaryDate)
+        var queryGt = new ProjectionQuery();
+        queryGt.Filters.Add(new Filter
+        {
+            PropertyName = "Items.AddedAt",
+            Operator = FilterOperator.Greater,
+            Value = boundaryDate
+        });
+
+        var ordersGt = await ProjectionsRepository.Query(queryGt);
+        ordersGt.TotalRecordsFound.Should().Be(1, "Greater should exclude the boundary value");
+    }
+
+    [TestMethod]
+    public virtual async Task TestProjectionsQueryFilterDateTimeLowerVsLowerOrEqual()
+    {
+        var orderRepository = new OrderRepository(await GetEventStore());
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        var boundaryDate = new DateTime(2020, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+
+        // Order 1: item exactly at boundary
+        var order1Items = new List<OrderItem>
+        {
+            new OrderItem(boundaryDate, "Boundary Item", 10.00m)
+        };
+        var order1 = new Order(Guid.NewGuid(), "Boundary Order", order1Items, userId, "john@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order1);
+
+        // Order 2: item before boundary
+        var order2Items = new List<OrderItem>
+        {
+            new OrderItem(boundaryDate.AddHours(-1), "Before Item", 20.00m)
+        };
+        var order2 = new Order(Guid.NewGuid(), "Before Order", order2Items, userId, "jane@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order2);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // LowerOrEqual should include the boundary (both orders have items <= boundaryDate)
+        var queryLte = new ProjectionQuery();
+        queryLte.Filters.Add(new Filter
+        {
+            PropertyName = "Items.AddedAt",
+            Operator = FilterOperator.LowerOrEqual,
+            Value = boundaryDate
+        });
+
+        var ordersLte = await ProjectionsRepository.Query(queryLte);
+        ordersLte.TotalRecordsFound.Should().Be(2, "LowerOrEqual should include the boundary value");
+
+        // Lower should exclude the boundary (only order2 has item < boundaryDate)
+        var queryLt = new ProjectionQuery();
+        queryLt.Filters.Add(new Filter
+        {
+            PropertyName = "Items.AddedAt",
+            Operator = FilterOperator.Lower,
+            Value = boundaryDate
+        });
+
+        var ordersLt = await ProjectionsRepository.Query(queryLt);
+        ordersLt.TotalRecordsFound.Should().Be(1, "Lower should exclude the boundary value");
+    }
+
+    [TestMethod]
+    public virtual async Task TestProjectionsQueryFilterNumericGreaterVsGreaterOrEqual()
+    {
+        var orderRepository = new OrderRepository(await GetEventStore());
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Order with exactly 2 items
+        var order1Items = new List<OrderItem>
+        {
+            new OrderItem(DateTime.UtcNow, "Item A", 10.00m),
+            new OrderItem(DateTime.UtcNow, "Item B", 20.00m)
+        };
+        var order1 = new Order(Guid.NewGuid(), "Two Items Order", order1Items, userId, "john@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order1);
+
+        // Order with 3 items
+        var order2Items = new List<OrderItem>
+        {
+            new OrderItem(DateTime.UtcNow, "Item C", 10.00m),
+            new OrderItem(DateTime.UtcNow, "Item D", 20.00m),
+            new OrderItem(DateTime.UtcNow, "Item E", 30.00m)
+        };
+        var order2 = new Order(Guid.NewGuid(), "Three Items Order", order2Items, userId, "jane@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order2);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // GreaterOrEqual 2 should include both orders
+        var queryGte = new ProjectionQuery();
+        queryGte.Filters.Add(new Filter
+        {
+            PropertyName = "ItemsCount",
+            Operator = FilterOperator.GreaterOrEqual,
+            Value = 2L
+        });
+
+        var ordersGte = await ProjectionsRepository.Query(queryGte);
+        ordersGte.TotalRecordsFound.Should().Be(2, "GreaterOrEqual should include the boundary value");
+
+        // Greater 2 should only include the 3-item order
+        var queryGt = new ProjectionQuery();
+        queryGt.Filters.Add(new Filter
+        {
+            PropertyName = "ItemsCount",
+            Operator = FilterOperator.Greater,
+            Value = 2L
+        });
+
+        var ordersGt = await ProjectionsRepository.Query(queryGt);
+        ordersGt.TotalRecordsFound.Should().Be(1, "Greater should exclude the boundary value");
+    }
+
+    [TestMethod]
+    public virtual async Task TestProjectionsQueryFilterSameFieldTwice()
+    {
+        var orderRepository = new OrderRepository(await GetEventStore());
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        var order1 = new Order(Guid.NewGuid(), "Small Order", new List<OrderItem>
+        {
+            new OrderItem(DateTime.UtcNow, "Item", 10.00m)
+        }, userId, "john@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order1);
+
+        var order2 = new Order(Guid.NewGuid(), "Medium Order", new List<OrderItem>
+        {
+            new OrderItem(DateTime.UtcNow, "Item A", 10.00m),
+            new OrderItem(DateTime.UtcNow, "Item B", 20.00m),
+            new OrderItem(DateTime.UtcNow, "Item C", 30.00m)
+        }, userId, "jane@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order2);
+
+        var order3 = new Order(Guid.NewGuid(), "Large Order", new List<OrderItem>
+        {
+            new OrderItem(DateTime.UtcNow, "I1", 1m),
+            new OrderItem(DateTime.UtcNow, "I2", 2m),
+            new OrderItem(DateTime.UtcNow, "I3", 3m),
+            new OrderItem(DateTime.UtcNow, "I4", 4m),
+            new OrderItem(DateTime.UtcNow, "I5", 5m)
+        }, userId, "bob@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order3);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Filter: ItemsCount >= 2 AND ItemsCount <= 4 (should match only order2 with 3 items)
+        var query = new ProjectionQuery();
+        query.Filters.Add(new Filter
+        {
+            PropertyName = "ItemsCount",
+            Operator = FilterOperator.GreaterOrEqual,
+            Value = 2L
+        });
+        query.Filters.Add(new Filter
+        {
+            PropertyName = "ItemsCount",
+            Operator = FilterOperator.LowerOrEqual,
+            Value = 4L
+        });
+
+        var orders = await ProjectionsRepository.Query(query);
+        orders.TotalRecordsFound.Should().Be(1);
+        orders.Records.First().Document!.Name.Should().Be("Medium Order");
+    }
+
     #region Cross-Aggregate Event Tests
 
     [TestMethod]

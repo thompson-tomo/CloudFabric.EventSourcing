@@ -1,4 +1,4 @@
-using CloudFabric.Projections.ElasticSearch.Extensions;
+using CloudFabric.Projections.Exceptions;
 using CloudFabric.Projections.Queries;
 using Nest;
 using Filter = CloudFabric.Projections.Queries.Filter;
@@ -7,261 +7,260 @@ namespace CloudFabric.Projections.ElasticSearch.Helpers;
 
 public static class ElasticSearchFilterFactory
 {
-    public static List<QueryContainer> ConstructFilters(List<Queries.Filter> filters)
+    public static List<QueryContainer> ConstructFilters(
+        List<Filter> filters,
+        ProjectionDocumentSchema? schema = null)
     {
-        var filterStrings = new List<string>();
-
-        // create 1st-layer filters
-        foreach (var f in filters)
-        {
-            var conditionFilter = $"({ConstructConditionFilter(f)})";
-            var propName = f.PropertyName ?? f.Filters[0].Filter.PropertyName;
-
-            if (propName != null && propName.IndexOf(".", StringComparison.Ordinal) == -1)
-            {
-                filterStrings.Add(conditionFilter);
-            }
-        }
-
-        var filter = new List<QueryContainer>()
-        {
-            new QueryStringQuery()
-            {
-                Query = string.Join(" AND ", filterStrings),
-                AllowLeadingWildcard = true,
-                AnalyzeWildcard = true
-            }
-        };
-
-        // create nested filters
-        var nestedQueryStrings = ConstructNestedQueryFilters(filters);
-
-        foreach (var entry in nestedQueryStrings)
-        {
-            var nestedFilter = new NestedQuery()
-            {
-                Path = entry.Key,
-                Query = new BoolQuery()
-                {
-                    Filter = new List<QueryContainer>()
-                    {
-                        new QueryStringQuery()
-                        {
-                            Query = entry.Value,
-                            AllowLeadingWildcard = true,
-                            AnalyzeWildcard = true
-                        }
-                    }
-                }
-            };
-
-            filter.Add(nestedFilter);
-        }
-
-        return filter;
-    }
-
-    private static Dictionary<string, string> ConstructNestedQueryFilters(List<Queries.Filter> filters)
-    {
-        var result = new Dictionary<string, string>();
+        var result = new List<QueryContainer>();
 
         if (filters == null || filters.Count == 0)
         {
             return result;
         }
 
-        var nestedFiltersStrings = new Dictionary<string, List<string>>();
+        var nestedQueries = new Dictionary<string, List<QueryContainer>>();
 
         foreach (var f in filters)
         {
-            var propName = f.PropertyName == null ? f.Filters[0].Filter.PropertyName : f.PropertyName;
-            var pathParts = propName.Split('.');
+            var propName = f.PropertyName ?? f.Filters.FirstOrDefault()?.Filter.PropertyName;
+            var isNested = propName != null && propName.Contains('.');
 
-            if (pathParts.Count() <= 1)
+            var query = ConstructConditionFilter(f, schema);
+            if (query == null) continue;
+
+            if (isNested)
             {
-                continue;
+                var pathParts = propName!.Split('.');
+                var nestedPath = string.Join(".", pathParts.Take(pathParts.Length - 1));
+
+                if (!nestedQueries.ContainsKey(nestedPath))
+                {
+                    nestedQueries[nestedPath] = new List<QueryContainer>();
+                }
+
+                nestedQueries[nestedPath].Add(query);
             }
-
-            var conditionFilter = $"({ConstructConditionFilter(f)})";
-            var nestedPath = string.Join(".", pathParts.Take(pathParts.Length - 1));
-
-            if (!nestedFiltersStrings.ContainsKey(nestedPath))
+            else
             {
-                nestedFiltersStrings[nestedPath] = new List<string>();
+                result.Add(query);
             }
-
-            nestedFiltersStrings[nestedPath].Add(conditionFilter);
         }
 
-        foreach (var entry in nestedFiltersStrings)
+        foreach (var entry in nestedQueries)
         {
-            result[entry.Key] = string.Join(" AND ", entry.Value);
+            result.Add(new NestedQuery
+            {
+                Path = entry.Key,
+                Query = new BoolQuery
+                {
+                    Filter = entry.Value
+                }
+            });
         }
 
         return result;
     }
 
-    private static string ConstructConditionFilter(Queries.Filter filter)
+    private static QueryContainer? ConstructConditionFilter(Filter filter, ProjectionDocumentSchema? schema)
     {
-        var q = ConstructOneConditionFilter(filter);
+        var thisQuery = ConstructOneConditionFilter(filter, schema);
 
-        foreach (FilterConnector f in filter.Filters)
+        if (filter.Filters.Count == 0)
         {
-            if (!string.IsNullOrEmpty(q) && f.Logic != null)
-            {
-                q += $" {f.Logic.ToUpper()} ";
-            }
-
-            var wrapWithParentheses = f.Logic != null;
-
-            if (wrapWithParentheses)
-            {
-                q += "(";
-            }
-
-            q += ConstructConditionFilter(f.Filter);
-
-            if (wrapWithParentheses)
-            {
-                q += ")";
-            }
+            return thisQuery;
         }
 
-        return q;
+        QueryContainer? current = thisQuery;
+
+        foreach (var connector in filter.Filters)
+        {
+            var childQuery = ConstructConditionFilter(connector.Filter, schema);
+            if (childQuery == null) continue;
+
+            if (current == null)
+            {
+                current = childQuery;
+                continue;
+            }
+
+            current = connector.Logic switch
+            {
+                FilterLogic.And => new BoolQuery
+                {
+                    Must = new List<QueryContainer> { current, childQuery }
+                },
+                FilterLogic.Or => new BoolQuery
+                {
+                    Should = new List<QueryContainer> { current, childQuery },
+                    MinimumShouldMatch = 1
+                },
+                _ => current
+            };
+        }
+
+        return current;
     }
 
-    private static string ConstructOneConditionFilter(Queries.Filter filter)
+    private static QueryContainer? ConstructOneConditionFilter(Filter filter, ProjectionDocumentSchema? schema)
     {
         if (string.IsNullOrEmpty(filter.PropertyName) || filter.PropertyName == "*")
         {
-            return "";
+            return null;
         }
 
-        if (filter.Value is DateTime || filter.Value is DateTime?)
+        if (schema != null)
         {
-            return ConstructDateTimeOneConditionFilter(filter);
+            var rootPropertyName = filter.PropertyName.Split('.')[0];
+            var propSchema = schema.Properties.FirstOrDefault(p => p.PropertyName == rootPropertyName);
+            if (propSchema == null)
+            {
+                throw new ProjectionQueryFilterException(filter.PropertyName, schema.SchemaName);
+            }
         }
 
         var propertyName = filter.PropertyName;
-        var filterOperator = "";
-        var filterValue = filter.Value?.ToString()?.EscapeElasticUnsupportedCharacters();
 
-        if (filter.Value is bool)
-        {
-            filterValue = filterValue.ToLower();
-        }
-
-        switch (filter.Operator)
-        {
-            case FilterOperator.ArrayContains:
-                filterOperator = ":";
-                filterValue = $"{filterValue}";
-                break;
-            case FilterOperator.Contains:
-                filterOperator = ":";
-                filterValue = $"*{filterValue}*";
-                break;
-            case FilterOperator.ContainsIgnoreCase:
-                filterOperator = ":";
-                filterValue = $"*{filterValue}*";
-                propertyName += ".case-insensitive";
-                break;
-            case FilterOperator.StartsWith:
-                filterOperator = ":";
-                filterValue = $"{filterValue}*";
-                break;
-            case FilterOperator.StartsWithIgnoreCase:
-                filterOperator = ":";
-                filterValue = $"{filterValue}*";
-                propertyName += ".case-insensitive";
-                break;
-            case FilterOperator.EndsWith:
-                filterOperator = ":";
-                filterValue = $"*{filterValue}";
-                break;
-            case FilterOperator.EndsWithIgnoreCase:
-                filterOperator = ":";
-                filterValue = $"*{filterValue}";
-                propertyName += ".case-insensitive";
-                break;
-            case FilterOperator.NotEqual:
-            case FilterOperator.Equal:
-                filterOperator = ":";
-                if (filter.Value is string)
-                {
-                    // for filter conditions we need exact match
-                    filterValue = $"\"{filterValue}\"";
-                }
-                break;
-            case FilterOperator.Greater:
-                filterOperator = ":>";
-                break;
-            case FilterOperator.GreaterOrEqual:
-                filterOperator = ":>=";
-                break;
-            case FilterOperator.Lower:
-                filterOperator = ":<";
-                break;
-            case FilterOperator.LowerOrEqual:
-                filterOperator = ":<=";
-                break;
-        }
-
-        var condition = $"{propertyName}{filterOperator}{filterValue}";
+        // Handle null values before any type-specific logic
         if (filter.Value == null)
         {
-            if (filter.Operator == FilterOperator.NotEqual)
+            return filter.Operator switch
             {
-                return $"(_exists_:{propertyName})";
-            } 
-            else if (filter.Operator == FilterOperator.Equal)
-            {
-                return $"(!(_exists_:{propertyName}))";
-            }
-            else
-            {
-                throw new ArgumentException("Comparing to null should only be via equal or not equal operators.");
-            }
-        }
-        else if (filter.Operator == FilterOperator.NotEqual)
-        {
-            return $"(!({condition}))";
+                FilterOperator.Equal => new BoolQuery
+                {
+                    MustNot = new List<QueryContainer> { new ExistsQuery { Field = propertyName } }
+                },
+                FilterOperator.NotEqual => new ExistsQuery { Field = propertyName },
+                _ => throw new ArgumentException(
+                    "Comparing to null should only be via equal or not equal operators.")
+            };
         }
 
-        return condition;
+        // Handle DateTime
+        if (filter.Value is DateTime dateValue)
+        {
+            return ConstructDateTimeFilter(propertyName, filter.Operator, dateValue);
+        }
+
+        // Determine field name for case-insensitive operations
+        var isIgnoreCase = filter.Operator
+            is FilterOperator.ContainsIgnoreCase
+            or FilterOperator.StartsWithIgnoreCase
+            or FilterOperator.EndsWithIgnoreCase;
+
+        if (isIgnoreCase)
+        {
+            propertyName += ".case-insensitive";
+        }
+
+        var stringValue = filter.Value.ToString() ?? "";
+
+        if (isIgnoreCase)
+        {
+            stringValue = stringValue.ToLowerInvariant();
+        }
+
+        // Guid fields are mapped as Text in ES (TypeCode.Object → text with standard analyzer).
+        // TermQuery doesn't analyze input, so it can't match tokenized Guid values.
+        // Use MatchQuery which applies the field's analyzer to the input — works for both keyword and text fields.
+        var equalQuery = filter.Value is Guid
+            ? (QueryContainer)new MatchQuery { Field = propertyName, Query = stringValue, Operator = Operator.And }
+            : new TermQuery { Field = propertyName, Value = filter.Value };
+
+        return filter.Operator switch
+        {
+            FilterOperator.Equal => equalQuery,
+            FilterOperator.NotEqual => new BoolQuery
+            {
+                MustNot = new List<QueryContainer> { equalQuery }
+            },
+            FilterOperator.Greater => ConstructNumericRangeQuery(propertyName, filter.Value, greaterThan: true, inclusive: false),
+            FilterOperator.GreaterOrEqual => ConstructNumericRangeQuery(propertyName, filter.Value, greaterThan: true, inclusive: true),
+            FilterOperator.Lower => ConstructNumericRangeQuery(propertyName, filter.Value, greaterThan: false, inclusive: false),
+            FilterOperator.LowerOrEqual => ConstructNumericRangeQuery(propertyName, filter.Value, greaterThan: false, inclusive: true),
+            FilterOperator.StartsWith => new WildcardQuery { Field = propertyName, Value = $"{EscapeWildcardValue(stringValue)}*" },
+            FilterOperator.StartsWithIgnoreCase => new WildcardQuery { Field = propertyName, Value = $"{EscapeWildcardValue(stringValue)}*" },
+            FilterOperator.EndsWith => new WildcardQuery { Field = propertyName, Value = $"*{EscapeWildcardValue(stringValue)}" },
+            FilterOperator.EndsWithIgnoreCase => new WildcardQuery { Field = propertyName, Value = $"*{EscapeWildcardValue(stringValue)}" },
+            FilterOperator.Contains => new WildcardQuery { Field = propertyName, Value = $"*{EscapeWildcardValue(stringValue)}*" },
+            FilterOperator.ContainsIgnoreCase => new WildcardQuery { Field = propertyName, Value = $"*{EscapeWildcardValue(stringValue)}*" },
+            FilterOperator.ArrayContains => new TermQuery { Field = propertyName, Value = filter.Value },
+            _ => throw new ArgumentException($"Unsupported filter operator: {filter.Operator}")
+        };
     }
 
-    private static string ConstructDateTimeOneConditionFilter(Queries.Filter filter)
+    private static QueryContainer ConstructDateTimeFilter(
+        string propertyName, string filterOperator, DateTime dateValue)
     {
-        if (filter.Value == null)
+        return filterOperator switch
         {
-            return $"({filter.PropertyName}:null OR (!(_exists_:{filter.PropertyName})))";
+            FilterOperator.Equal => new DateRangeQuery
+            {
+                Field = propertyName,
+                GreaterThanOrEqualTo = dateValue,
+                LessThanOrEqualTo = dateValue
+            },
+            FilterOperator.NotEqual => new BoolQuery
+            {
+                MustNot = new List<QueryContainer>
+                {
+                    new DateRangeQuery
+                    {
+                        Field = propertyName,
+                        GreaterThanOrEqualTo = dateValue,
+                        LessThanOrEqualTo = dateValue
+                    }
+                }
+            },
+            FilterOperator.Greater => new DateRangeQuery
+            {
+                Field = propertyName,
+                GreaterThan = dateValue
+            },
+            FilterOperator.GreaterOrEqual => new DateRangeQuery
+            {
+                Field = propertyName,
+                GreaterThanOrEqualTo = dateValue
+            },
+            FilterOperator.Lower => new DateRangeQuery
+            {
+                Field = propertyName,
+                LessThan = dateValue
+            },
+            FilterOperator.LowerOrEqual => new DateRangeQuery
+            {
+                Field = propertyName,
+                LessThanOrEqualTo = dateValue
+            },
+            _ => throw new ArgumentException(
+                $"Unsupported filter operator for DateTime: {filterOperator}")
+        };
+    }
+
+    private static QueryContainer ConstructNumericRangeQuery(
+        string propertyName, object value, bool greaterThan, bool inclusive)
+    {
+        var doubleValue = Convert.ToDouble(value);
+        var query = new NumericRangeQuery { Field = propertyName };
+
+        if (greaterThan)
+        {
+            if (inclusive) query.GreaterThanOrEqualTo = doubleValue;
+            else query.GreaterThan = doubleValue;
+        }
+        else
+        {
+            if (inclusive) query.LessThanOrEqualTo = doubleValue;
+            else query.LessThan = doubleValue;
         }
 
-        var filterValue = ((DateTime)filter.Value).ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
-        switch (filter.Operator)
-        {
-            case FilterOperator.NotEqual:
-            case FilterOperator.Equal:
-                filterValue = $"[{filterValue} TO {filterValue}]";
-                break;
-            case FilterOperator.Greater:
-            case FilterOperator.GreaterOrEqual:
-                filterValue = $"[{filterValue} TO *]";
-                break;
-            case FilterOperator.Lower:
-            case FilterOperator.LowerOrEqual:
-                filterValue = $"[* TO {filterValue}]";
-                break;
-        }
+        return query;
+    }
 
-        var condition = $"{filter.PropertyName}:{filterValue}";
-
-        if (filter.Operator == FilterOperator.NotEqual)
-        {
-            return $"!({condition})";
-        }
-
-        return condition;
+    private static string EscapeWildcardValue(string value)
+    {
+        return value
+            .Replace("\\", "\\\\")
+            .Replace("*", "\\*")
+            .Replace("?", "\\?");
     }
 }

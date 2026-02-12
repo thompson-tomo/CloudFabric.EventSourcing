@@ -854,6 +854,8 @@ public class PostgresqlProjectionRepository : ProjectionRepository
             case FilterOperator.ArrayContains:
                 filterOperator = "?";
                 break;
+            default:
+                throw new ArgumentException($"Unsupported filter operator: {filter.Operator}");
         }
         
         var npgsqlParameter = new NpgsqlParameter(propertyParameterName, filter.Value ?? DBNull.Value);
@@ -991,12 +993,37 @@ public class PostgresqlProjectionRepository : ProjectionRepository
     private QueryChunk ConstructConditionFilters(List<Filter> filters, ProjectionDocumentSchema schema)
     {
         var queryChunk = new QueryChunk();
-        
+
         var whereClauses = new List<string>();
-        
+
         foreach (var f in filters)
         {
             var filterQueryChunk = ConstructConditionFilter(f, schema);
+
+            // Deduplicate parameter names across top-level filters
+            foreach (var filterParameter in filterQueryChunk.Parameters)
+            {
+                while (queryChunk.Parameters.Any(p => p.ParameterName == filterParameter.ParameterName))
+                {
+                    var newParameterName = filterParameter.ParameterName;
+
+                    var parameterNumberMatch = new Regex(".*(_\\d+)$").Match(filterParameter.ParameterName);
+
+                    if (parameterNumberMatch.Success)
+                    {
+                        var number = int.Parse(parameterNumberMatch.Groups[1].Value.Replace("_", ""));
+                        newParameterName = newParameterName.Replace(parameterNumberMatch.Groups[1].Value, $"_{number + 1}");
+                    }
+                    else
+                    {
+                        newParameterName = newParameterName + "_1";
+                    }
+
+                    filterQueryChunk.WhereChunk = filterQueryChunk.WhereChunk.Replace($"@{filterParameter.ParameterName}", $"@{newParameterName}");
+                    filterParameter.ParameterName = newParameterName;
+                }
+            }
+
             whereClauses.Add($"({filterQueryChunk.WhereChunk})");
             queryChunk.Parameters.AddRange(filterQueryChunk.Parameters);
             //Don't add duplicates

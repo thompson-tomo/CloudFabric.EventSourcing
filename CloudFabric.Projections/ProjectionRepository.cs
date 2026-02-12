@@ -64,6 +64,32 @@ public abstract class ProjectionRepository : IProjectionRepository
 
         Logger.LogInformation("Index for {ProjectionDocumentSchemaName}, {IndexName}", ProjectionDocumentSchema.SchemaName, indexName);
     }
+
+    /// <summary>
+    /// Clears all entries from the projection_index_state metadata table, dropping physical
+    /// indices/tables for each stored schema version.
+    /// Useful for test isolation to prevent stale schema entries from previous test runs.
+    /// </summary>
+    public async Task ClearAllProjectionIndexStates(CancellationToken cancellationToken = default)
+    {
+        var allStates = await QueryProjectionIndexStates(new Queries.ProjectionQuery(), cancellationToken);
+        foreach (var state in allStates)
+        {
+            foreach (var indexStatus in state.IndexesStatuses)
+            {
+                try
+                {
+                    await DropIndex(indexStatus.IndexName, cancellationToken);
+                }
+                catch (Exception)
+                {
+                    // Index may not exist (already dropped or never created)
+                }
+            }
+            state.IndexesStatuses.Clear();
+            await SaveProjectionIndexState(state);
+        }
+    }
     
     protected abstract Task CreateIndex(string indexName, ProjectionDocumentSchema projectionDocumentSchema);
 
@@ -277,11 +303,11 @@ public abstract class ProjectionRepository : IProjectionRepository
     /// </summary>
     /// <returns></returns>
     protected async Task<ProjectionOperationIndexDescriptor> GetIndexDescriptorForOperation(
-        ProjectionOperationIndexSelector indexSelector, 
+        ProjectionOperationIndexSelector indexSelector,
         CancellationToken cancellationToken = default
     ) {
         var projectionIndexState = await GetProjectionIndexState(cancellationToken);
-        
+
         var projectionVersionPropertiesHash = ProjectionDocumentSchemaFactory.GetPropertiesUniqueHash(ProjectionDocumentSchema.Properties);
         var projectionVersionIndexName = $"{ProjectionDocumentSchema.SchemaName}_{projectionVersionPropertiesHash}"
             .ToLower(); // Elastic throws error saying that index must be lowercase
@@ -291,7 +317,7 @@ public abstract class ProjectionRepository : IProjectionRepository
             // First of all - check if index statuses contains an index for this particular schema version
             var indexStatusForThisSchemaVersion = projectionIndexState.IndexesStatuses
                 .FirstOrDefault(indexStatus => indexStatus.SchemaHash == projectionVersionPropertiesHash);
-            
+
             if (indexStatusForThisSchemaVersion == null)
             {
                 // If it does not, we need to create it so that it will be picked up by projections rebuild processor
@@ -324,13 +350,31 @@ public abstract class ProjectionRepository : IProjectionRepository
 
             if (lastIndexWithRebuiltProjections != null)
             {
+                var returnedSchema = JsonSerializer.Deserialize<ProjectionDocumentSchema>(lastIndexWithRebuiltProjections.Schema!)!;
                 return new ProjectionOperationIndexDescriptor() {
                     IndexName = lastIndexWithRebuiltProjections.IndexName,
-                    ProjectionDocumentSchema = JsonSerializer.Deserialize<ProjectionDocumentSchema>(lastIndexWithRebuiltProjections.Schema!)!
+                    ProjectionDocumentSchema = returnedSchema
                 };
             }
-            
-            // At least some projection state exists but there is no index which was completely rebuilt. 
+
+            // Brand-new index: single index that has never started a rebuild.
+            // This happens when EnsureIndex() creates the state but no events exist yet to replay.
+            // It's safe to write to it directly — there are no preceding events that could be out of order.
+            if (projectionIndexState.IndexesStatuses.Count == 1)
+            {
+                var singleIndex = projectionIndexState.IndexesStatuses[0];
+                if (singleIndex.RebuildStartedAt == null && singleIndex.RebuildCompletedAt == null)
+                {
+                    var returnedSchema2 = JsonSerializer.Deserialize<ProjectionDocumentSchema>(singleIndex.Schema!)!;
+                    return new ProjectionOperationIndexDescriptor()
+                    {
+                        IndexName = singleIndex.IndexName,
+                        ProjectionDocumentSchema = returnedSchema2
+                    };
+                }
+            }
+
+            // At least some projection state exists but there is no index which was completely rebuilt.
             // In such situation we could only allow reading from this index, because writing to it may break projections
             // events order consistency - if projections rebuild is still in progress we will write an event which happened now before it's preceding
             // events not yet processed by projections rebuild process.
@@ -342,21 +386,23 @@ public abstract class ProjectionRepository : IProjectionRepository
 
                 if (lastIndexWithRebuildStarted != null)
                 {
+                    var returnedSchema3 = JsonSerializer.Deserialize<ProjectionDocumentSchema>(lastIndexWithRebuildStarted.Schema!)!;
                     return new ProjectionOperationIndexDescriptor() {
                         IndexName = lastIndexWithRebuildStarted.IndexName,
-                        ProjectionDocumentSchema = JsonSerializer.Deserialize<ProjectionDocumentSchema>(lastIndexWithRebuildStarted.Schema!)!
+                        ProjectionDocumentSchema = returnedSchema3
                     };
                 }
-                
+
                 // If there are multiple indexes but none of them started rebuilding, just return the most recently created one.
                 var lastIndex = projectionIndexState.IndexesStatuses
                     .MaxBy(i => i.CreatedAt);
 
                 if (lastIndex != null)
                 {
+                    var returnedSchema4 = JsonSerializer.Deserialize<ProjectionDocumentSchema>(lastIndex.Schema!)!;
                     return new ProjectionOperationIndexDescriptor() {
                         IndexName = lastIndex.IndexName,
-                        ProjectionDocumentSchema = JsonSerializer.Deserialize<ProjectionDocumentSchema>(lastIndex.Schema!)!
+                        ProjectionDocumentSchema = returnedSchema4
                     };
                 }
             }
@@ -369,6 +415,7 @@ public abstract class ProjectionRepository : IProjectionRepository
             // Create an empty index state, index background processor is designed to look for records which 
             // were created but not populated, it will start the process of projections rebuild once it finds this new record.
             
+            var schemaJson = JsonSerializer.Serialize(ProjectionDocumentSchema);
             var newProjectionIndexState = new ProjectionIndexState()
             {
                 Id = Guid.NewGuid(),
@@ -378,7 +425,7 @@ public abstract class ProjectionRepository : IProjectionRepository
                     new IndexStateForSchemaVersion()
                     {
                         CreatedAt = DateTime.UtcNow,
-                        Schema = JsonSerializer.Serialize(ProjectionDocumentSchema),
+                        Schema = schemaJson,
                         SchemaHash = projectionVersionPropertiesHash,
                         IndexName = projectionVersionIndexName,
                         RebuildEventsProcessed = 0,

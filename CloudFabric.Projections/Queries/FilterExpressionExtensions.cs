@@ -85,35 +85,34 @@ public static class FilterExpressionExtensions {
                 
                 foreach (var prop in propertyNamesPath.Skip(1))
                 {
-                    // Assume that object? is a dictionary whose keys are property names and values are... values with object? type
-                    bool isDictionary = false;//propertyType == typeof(object) || propertyType.Name.Contains("Dictionary");
-                    bool isList = true;
+                    // At runtime, the nested value can be either:
+                    // 1. A Dictionary<string, object?> (nested object, e.g. EntityReference with denormalized data)
+                    // 2. A List/Array (nested array, e.g. CategoryPaths, LocalizedText)
+                    // We generate a conditional expression that checks the type at runtime.
+                    var nestedDictType = typeof(Dictionary<string, object?>);
+                    var isDictCheck = Expression.TypeIs(property, nestedDictType);
 
-                    if (isDictionary)
-                    {
-                        property = Expression.MakeIndex(
-                            Expression.Convert(property, typeof(Dictionary<string, object?>)),
-                            dictionaryIndexProperty,
-                            new[] { Expression.Constant(prop) }
-                        );
-                    }
-                    else if (isList)
-                    {
-                        var arrayFilterPredicateParameter = Expression.Parameter(typeof(object), "i");
-                        var arrayFilterPredicate = ToExpression(arrayFilterPredicateParameter, filter.Operator, filter.Value, prop);
-                        
-                        property = ConstructArrayExistsExpressionFromFilter(
-                            property, 
-                            arrayFilterPredicateParameter,
-                            arrayFilterPredicate    
-                        );
-                        
-                        return (property, parameter);
-                    }
-                    else 
-                    {
-                        property = Expression.PropertyOrField(property, prop);
-                    }
+                    // Dictionary branch: cast to dict, index by property name, compare with filter value
+                    var dictCast = Expression.Convert(property, nestedDictType);
+                    var dictValue = Expression.MakeIndex(
+                        dictCast,
+                        nestedDictType.GetProperty("Item"),
+                        new[] { Expression.Constant(prop) }
+                    );
+                    var dictComparison = ToExpression(dictValue, filter.Operator, filter.Value);
+
+                    // Array branch: use Array.Exists with predicate
+                    var arrayFilterPredicateParameter = Expression.Parameter(typeof(object), "i");
+                    var arrayFilterPredicate = ToExpression(arrayFilterPredicateParameter, filter.Operator, filter.Value, prop);
+                    var arrayComparison = ConstructArrayExistsExpressionFromFilter(
+                        property,
+                        arrayFilterPredicateParameter,
+                        arrayFilterPredicate
+                    );
+
+                    // Runtime conditional: if value is Dictionary → dict comparison, else → array exists
+                    property = Expression.Condition(isDictCheck, dictComparison, arrayComparison);
+                    return (property, parameter);
                 }
             }
             else // simple dictionary index expression like ["propertyName"]
@@ -176,17 +175,26 @@ public static class FilterExpressionExtensions {
     private static Expression ToExpression(Expression parameter, string oper, object? value, string? parameterAccessor = null)
     {
         var valueExpression = Expression.Constant(value);
-        var operand = value == null ? (Expression)parameter : (Expression)Expression.Convert(parameter, value.GetType());
+        Expression operand;
 
         if (parameterAccessor != null)
         {
-            var castExpression = Expression.Convert(operand, typeof(Dictionary<string, object?>));
-            
+            // parameter is an array element (object) — cast to Dictionary first, then index by property name
+            var castExpression = Expression.Convert(parameter, typeof(Dictionary<string, object?>));
             operand = Expression.MakeIndex(
-                castExpression, 
+                castExpression,
                 typeof(Dictionary<string, object?>).GetProperty("Item"),
                 new[] { Expression.Constant(parameterAccessor) }
             );
+            // Convert the indexed value (object?) to the filter value type for comparison
+            if (value != null)
+            {
+                operand = Expression.Convert(operand, value.GetType());
+            }
+        }
+        else
+        {
+            operand = value == null ? (Expression)parameter : (Expression)Expression.Convert(parameter, value.GetType());
         }
 
         Expression thisExpression = oper switch

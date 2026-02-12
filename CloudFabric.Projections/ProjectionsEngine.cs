@@ -151,6 +151,9 @@ public class ProjectionsEngine : IProjectionsEngine
         {
             await _errorHandler.OnError(projectionBuilder, @event, ex);
         }
+
+        // Rethrow to surface errors during testing
+        throw new InvalidOperationException($"Projection builder error: {ex.Message}", ex);
     }
 
     public async Task ReplayEventsAsync(

@@ -467,6 +467,32 @@ public class CosmosDbProjectionRepository : ProjectionRepository
             }
 
             var (filterClause, filterParams) = ConstructConditionFilter(f.Filter);
+
+            // Deduplicate parameter names to avoid conflicts when filtering
+            // the same property multiple times (e.g. status = "active" AND status != "deleted")
+            foreach (var innerParam in filterParams)
+            {
+                while (parameters.Any(p => p.Name == innerParam.Name))
+                {
+                    var currentName = innerParam.Name;
+                    var match = System.Text.RegularExpressions.Regex.Match(currentName, @".*(_\d+)$");
+
+                    string newName;
+                    if (match.Success)
+                    {
+                        var number = int.Parse(match.Groups[1].Value.Replace("_", ""));
+                        newName = currentName.Replace(match.Groups[1].Value, $"_{number + 1}");
+                    }
+                    else
+                    {
+                        newName = currentName + "_1";
+                    }
+
+                    filterClause = filterClause.Replace($"@{innerParam.Name}", $"@{newName}");
+                    innerParam.Name = newName;
+                }
+            }
+
             q += filterClause;
             parameters.AddRange(filterParams);
 
