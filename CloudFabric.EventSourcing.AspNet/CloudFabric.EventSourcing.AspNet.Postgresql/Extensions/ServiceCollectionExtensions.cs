@@ -225,7 +225,8 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
 
                             return projectionsEngine;
                         },
-                        rebuildProcessorScope.ServiceProvider.GetRequiredService<ILogger<ProjectionsRebuildProcessor>>()
+                        rebuildProcessorScope.ServiceProvider.GetRequiredService<ILogger<ProjectionsRebuildProcessor>>(),
+                        metadataRepository: rebuildProcessorScope.ServiceProvider.GetRequiredKeyedService<IMetadataRepository>(builder.EventStoreKey)
                     );
 
                     var options = sp.GetRequiredService<IOptions<ProjectionsRebuildProcessorOptions>>();

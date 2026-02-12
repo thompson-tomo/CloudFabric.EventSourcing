@@ -140,14 +140,12 @@ public class CosmosDbProjectionRepository : ProjectionRepository
         await Task.CompletedTask;
     }
 
-    public override async Task<Dictionary<string, object?>?> Single(
-        Guid id, 
-        string partitionKey, 
-        CancellationToken cancellationToken = default,
-        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.ReadOnly
+    protected override async Task<Dictionary<string, object?>?> SingleInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        Guid id,
+        string partitionKey,
+        CancellationToken cancellationToken = default
     ) {
-        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
-        
         Container container = _client.GetContainer(_databaseId, _containerId);
         var sw = Stopwatch.StartNew();
 
@@ -185,15 +183,13 @@ public class CosmosDbProjectionRepository : ProjectionRepository
         }
     }
 
-    public override async Task Delete(
-        Guid id, 
-        string partitionKey, 
-        CancellationToken cancellationToken = default,
-        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
+    protected override async Task DeleteInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        Guid id,
+        string partitionKey,
+        CancellationToken cancellationToken = default
     ) {
         var sw = Stopwatch.StartNew();
-        
-        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
 
         Container container = _client.GetContainer(_databaseId, _containerId);
 

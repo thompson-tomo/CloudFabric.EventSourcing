@@ -5,17 +5,12 @@ namespace CloudFabric.EventSourcing.EventStore;
 ///
 /// Storage convention:
 /// - stream_id = DeterministicGuid(AggregateType) — isolates by target entity type
-/// - partition_key = TargetPartitionKey ?? "*" — isolates by tenant ("*" = all tenants)
+/// - partition_key = TargetPartitionKey — isolates by tenant (required)
 /// - AggregateId is set to Guid.Empty as a marker for global stream membership
 /// </summary>
 public record CrossAggregateEvent : Event, ICrossAggregateEvent
 {
-    /// <summary>
-    /// Partition key wildcard value meaning "all partitions/tenants".
-    /// </summary>
-    public const string AllPartitionsKey = "*";
-
-    public string? TargetPartitionKey { get; set; }
+    public string TargetPartitionKey { get; set; } = string.Empty;
 
     public CrossAggregateEvent()
     {

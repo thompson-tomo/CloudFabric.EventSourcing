@@ -14,7 +14,7 @@ namespace CloudFabric.EventSourcing.EventStore;
 public interface ICrossAggregateEvent : IEvent
 {
     /// <summary>
-    /// Partition key of the target aggregates. When null, the event applies to all partitions.
+    /// Partition key of the target aggregates. Required for tenant isolation.
     /// </summary>
-    string? TargetPartitionKey { get; set; }
+    string TargetPartitionKey { get; set; }
 }

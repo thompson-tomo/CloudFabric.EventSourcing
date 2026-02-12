@@ -269,6 +269,116 @@ public class InMemoryEventStore : IEventStore
         return true;
     }
 
+    public async Task AppendNewStreamsAsync(
+        EventUserInfo eventUserInfo,
+        IReadOnlyList<(Guid StreamId, string PartitionKey, IReadOnlyList<IEvent> Events)> streams,
+        CancellationToken cancellationToken = default)
+    {
+        if (streams.Count == 0) return;
+
+        var allEvents = new List<IEvent>();
+
+        lock (_lock)
+        {
+            foreach (var (streamId, partitionKey, events) in streams)
+            {
+                var eventsList = events.ToList();
+                var wrappers = PrepareEvents(eventUserInfo, streamId, 0, eventsList);
+                var stream = new List<string>();
+
+                foreach (var wrapper in wrappers)
+                {
+                    stream.Add(JsonSerializer.Serialize(wrapper, EventStoreSerializerOptions.Options));
+                }
+
+                _eventsContainer[(streamId, partitionKey)] = stream;
+                allEvents.AddRange(eventsList);
+            }
+        }
+
+        List<Func<IEvent, Task>> handlers;
+        lock (_lock)
+        {
+            handlers = _eventAddedEventHandlers.ToList();
+        }
+
+        foreach (var evt in allEvents)
+        {
+            foreach (var h in handlers)
+            {
+                await h(evt);
+            }
+        }
+    }
+
+    public async Task AppendToMultipleExistingStreamsAsync(
+        EventUserInfo eventUserInfo,
+        IReadOnlyList<(Guid StreamId, string PartitionKey, IReadOnlyList<IEvent> Events)> streams,
+        CancellationToken cancellationToken = default)
+    {
+        if (streams.Count == 0) return;
+
+        var allEvents = new List<IEvent>();
+
+        lock (_lock)
+        {
+            // 1. Verify all streams exist and get current versions
+            var versions = new Dictionary<(Guid, string), int>();
+
+            foreach (var (streamId, partitionKey, _) in streams)
+            {
+                var key = (streamId, partitionKey);
+                if (!_eventsContainer.TryGetValue(key, out var currentStream) || currentStream.Count == 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Stream {streamId} not found. Use AppendNewStreamsAsync for new streams.");
+                }
+
+                if (!versions.ContainsKey(key))
+                {
+                    var currentVersion = currentStream
+                        .Select(s => JsonSerializer.Deserialize<EventWrapper>(s, EventStoreSerializerOptions.Options)!)
+                        .Max(w => w.StreamInfo.Version);
+                    versions[key] = currentVersion;
+                }
+            }
+
+            // 2. Append events to each stream
+            foreach (var (streamId, partitionKey, events) in streams)
+            {
+                var key = (streamId, partitionKey);
+                var eventsList = events.ToList();
+                var currentVersion = versions[key];
+
+                var wrappers = PrepareEvents(eventUserInfo, streamId, currentVersion, eventsList);
+                var stream = _eventsContainer[key];
+
+                foreach (var wrapper in wrappers)
+                {
+                    stream.Add(JsonSerializer.Serialize(wrapper, EventStoreSerializerOptions.Options));
+                }
+
+                versions[key] = currentVersion + eventsList.Count;
+                allEvents.AddRange(eventsList);
+            }
+        }
+
+        // 3. Notify handlers outside lock
+        List<Func<IEvent, Task>> handlers;
+        lock (_lock)
+        {
+            handlers = _eventAddedEventHandlers.ToList();
+        }
+
+        foreach (var evt in allEvents)
+        {
+            foreach (var h in handlers)
+            {
+                await h(evt);
+            }
+        }
+    }
+
     private List<EventWrapper> LoadOrderedEventWrappers(Guid streamId, string partitionKey)
     {
         if (!_eventsContainer.TryGetValue((streamId, partitionKey), out var eventData))
@@ -338,7 +448,14 @@ public class InMemoryEventStore : IEventStore
     )
     {
         var streamId = DeterministicGuid.Create(@event.AggregateType);
-        var partitionKey = @event.TargetPartitionKey ?? CrossAggregateEvent.AllPartitionsKey;
+        if (string.IsNullOrEmpty(@event.TargetPartitionKey))
+        {
+            throw new ArgumentException(
+                "TargetPartitionKey is required for cross-aggregate events. " +
+                "Specify the partition key to ensure tenant isolation.",
+                nameof(@event));
+        }
+        var partitionKey = @event.TargetPartitionKey;
 
         @event.PartitionKey = partitionKey;
 
@@ -395,8 +512,7 @@ public class InMemoryEventStore : IEventStore
         if (partitionKey != null)
         {
             matchingKeys = _eventsContainer.Keys
-                .Where(k => k.StreamId == streamId &&
-                            (k.PartitionKey == partitionKey || k.PartitionKey == CrossAggregateEvent.AllPartitionsKey))
+                .Where(k => k.StreamId == streamId && k.PartitionKey == partitionKey)
                 .ToList();
         }
         else

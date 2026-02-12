@@ -530,6 +530,217 @@ public class PostgresqlEventStore : IEventStore
         return true;
     }
 
+    /// <summary>
+    /// Batch-insert events for multiple new streams in a single transaction using NpgsqlBatch.
+    /// Sub-batches of 5000 commands to stay within NpgsqlBatch limits.
+    /// </summary>
+    public async Task AppendNewStreamsAsync(
+        EventUserInfo eventUserInfo,
+        IReadOnlyList<(Guid StreamId, string PartitionKey, IReadOnlyList<IEvent> Events)> streams,
+        CancellationToken cancellationToken = default)
+    {
+        if (streams.Count == 0) return;
+
+        var connectionInformation = ConnectionInformation;
+        var userInfoJson = JsonSerializer.Serialize(eventUserInfo, eventUserInfo.GetType(), EventStoreSerializerOptions.Options);
+
+        await using var conn = new NpgsqlConnection(connectionInformation.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var transaction = await conn.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
+
+        const int subBatchSize = 5000;
+        var batch = new NpgsqlBatch(conn, transaction);
+
+        var allEvents = new List<IEvent>();
+
+        foreach (var (streamId, partitionKey, events) in streams)
+        {
+            var version = 0;
+            foreach (var evt in events)
+            {
+                batch.BatchCommands.Add(new NpgsqlBatchCommand(
+                    $"INSERT INTO \"{connectionInformation.TableName}\" " +
+                    $"(id, partition_key, created_at, stream_id, stream_version, event_type, event_data, user_info, eventstore_schema_version) " +
+                    $"VALUES " +
+                    $"(@id, @partition_key, @created_at, @stream_id, @stream_version, @event_type, @event_data, @user_info, @eventstore_schema_version)")
+                {
+                    Parameters =
+                    {
+                        new("id", Guid.NewGuid()),
+                        new("partition_key", partitionKey),
+                        new("created_at", evt.Timestamp),
+                        new("stream_id", streamId),
+                        new("stream_version", ++version),
+                        new("event_type", evt.GetType().AssemblyQualifiedName),
+                        new NpgsqlParameter()
+                        {
+                            ParameterName = "event_data",
+                            Value = JsonSerializer.Serialize(evt, evt.GetType(), EventStoreSerializerOptions.Options),
+                            DataTypeName = "jsonb"
+                        },
+                        new NpgsqlParameter()
+                        {
+                            ParameterName = "user_info",
+                            Value = userInfoJson,
+                            DataTypeName = "jsonb"
+                        },
+                        new NpgsqlParameter("eventstore_schema_version", EVENTSTORE_TABLE_SCHEMA_VERSION)
+                    }
+                });
+
+                allEvents.Add(evt);
+
+                if (batch.BatchCommands.Count >= subBatchSize)
+                {
+                    await batch.ExecuteNonQueryAsync(cancellationToken);
+                    batch.Dispose();
+                    batch = new NpgsqlBatch(conn, transaction);
+                }
+            }
+        }
+
+        if (batch.BatchCommands.Count > 0)
+        {
+            await batch.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        batch.Dispose();
+        await transaction.CommitAsync(cancellationToken);
+
+        // Notify handlers after commit
+        var handlers = _eventAddedEventHandlers.ToList();
+        foreach (var evt in allEvents)
+        {
+            foreach (var h in handlers)
+            {
+                await h(evt);
+            }
+        }
+    }
+
+    public async Task AppendToMultipleExistingStreamsAsync(
+        EventUserInfo eventUserInfo,
+        IReadOnlyList<(Guid StreamId, string PartitionKey, IReadOnlyList<IEvent> Events)> streams,
+        CancellationToken cancellationToken = default)
+    {
+        if (streams.Count == 0) return;
+
+        var connectionInformation = ConnectionInformation;
+        var userInfoJson = JsonSerializer.Serialize(eventUserInfo, eventUserInfo.GetType(), EventStoreSerializerOptions.Options);
+
+        await using var conn = new NpgsqlConnection(connectionInformation.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var transaction = await conn.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
+
+        try
+        {
+            // 1. Load current max versions for all streams in one query
+            var streamIds = streams.Select(s => s.StreamId).Distinct().ToArray();
+            var versions = new Dictionary<Guid, int>();
+
+            await using (var cmd = new NpgsqlCommand(
+                $"SELECT stream_id, COALESCE(MAX(stream_version), 0) FROM \"{connectionInformation.TableName}\" WHERE stream_id = ANY(@ids) GROUP BY stream_id",
+                conn, transaction))
+            {
+                cmd.Parameters.AddWithValue("ids", streamIds);
+
+                await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    versions[reader.GetGuid(0)] = reader.GetInt32(1);
+                }
+            }
+
+            // 2. Verify all streams exist
+            foreach (var streamId in streamIds)
+            {
+                if (!versions.ContainsKey(streamId))
+                {
+                    throw new InvalidOperationException(
+                        $"Stream {streamId} not found. Use AppendNewStreamsAsync for new streams.");
+                }
+            }
+
+            // 3. Batch INSERT all events with correct versions
+            const int subBatchSize = 5000;
+            var batch = new NpgsqlBatch(conn, transaction);
+            var allEvents = new List<IEvent>();
+
+            foreach (var (streamId, partitionKey, events) in streams)
+            {
+                var version = versions[streamId];
+                foreach (var evt in events)
+                {
+                    batch.BatchCommands.Add(new NpgsqlBatchCommand(
+                        $"INSERT INTO \"{connectionInformation.TableName}\" " +
+                        $"(id, partition_key, created_at, stream_id, stream_version, event_type, event_data, user_info, eventstore_schema_version) " +
+                        $"VALUES " +
+                        $"(@id, @partition_key, @created_at, @stream_id, @stream_version, @event_type, @event_data, @user_info, @eventstore_schema_version)")
+                    {
+                        Parameters =
+                        {
+                            new("id", Guid.NewGuid()),
+                            new("partition_key", partitionKey),
+                            new("created_at", evt.Timestamp),
+                            new("stream_id", streamId),
+                            new("stream_version", ++version),
+                            new("event_type", evt.GetType().AssemblyQualifiedName),
+                            new NpgsqlParameter()
+                            {
+                                ParameterName = "event_data",
+                                Value = JsonSerializer.Serialize(evt, evt.GetType(), EventStoreSerializerOptions.Options),
+                                DataTypeName = "jsonb"
+                            },
+                            new NpgsqlParameter()
+                            {
+                                ParameterName = "user_info",
+                                Value = userInfoJson,
+                                DataTypeName = "jsonb"
+                            },
+                            new NpgsqlParameter("eventstore_schema_version", EVENTSTORE_TABLE_SCHEMA_VERSION)
+                        }
+                    });
+
+                    allEvents.Add(evt);
+
+                    if (batch.BatchCommands.Count >= subBatchSize)
+                    {
+                        await batch.ExecuteNonQueryAsync(cancellationToken);
+                        batch.Dispose();
+                        batch = new NpgsqlBatch(conn, transaction);
+                    }
+                }
+
+                versions[streamId] = version;
+            }
+
+            if (batch.BatchCommands.Count > 0)
+            {
+                await batch.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            batch.Dispose();
+            await transaction.CommitAsync(cancellationToken);
+
+            // 4. Notify handlers after commit
+            var handlers = _eventAddedEventHandlers.ToList();
+            foreach (var evt in allEvents)
+            {
+                foreach (var h in handlers)
+                {
+                    await h(evt);
+                }
+            }
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
+        {
+            throw new InvalidOperationException(
+                "Concurrent modification detected during batch append to existing streams. " +
+                "One or more streams were modified by another process between version loading and event insertion.",
+                ex);
+        }
+    }
+
     public void SubscribeToEventAdded(Func<IEvent, Task> handler)
     {
         _eventAddedEventHandlers.Add(handler);
@@ -628,7 +839,14 @@ public class PostgresqlEventStore : IEventStore
     {
         var connectionInformation = ConnectionInformation;
         var streamId = DeterministicGuid.Create(@event.AggregateType);
-        var partitionKey = @event.TargetPartitionKey ?? CrossAggregateEvent.AllPartitionsKey;
+        if (string.IsNullOrEmpty(@event.TargetPartitionKey))
+        {
+            throw new ArgumentException(
+                "TargetPartitionKey is required for cross-aggregate events. " +
+                "Specify the partition key to ensure tenant isolation.",
+                nameof(@event));
+        }
+        var partitionKey = @event.TargetPartitionKey;
 
         @event.PartitionKey = partitionKey;
 
@@ -735,15 +953,14 @@ public class PostgresqlEventStore : IEventStore
         {
             sql = $"SELECT id, stream_id, stream_version, event_type, event_data, user_info " +
                   $"FROM \"{connectionInformation.TableName}\" " +
-                  $"WHERE stream_id = @streamId AND (partition_key = @partitionKey OR partition_key = @allPartitionsKey) " +
+                  $"WHERE stream_id = @streamId AND partition_key = @partitionKey " +
                   $"ORDER BY created_at ASC";
             cmd = new NpgsqlCommand(sql, conn)
             {
                 Parameters =
                 {
                     new("streamId", streamId),
-                    new("partitionKey", partitionKey),
-                    new("allPartitionsKey", CrossAggregateEvent.AllPartitionsKey)
+                    new("partitionKey", partitionKey)
                 }
             };
         }

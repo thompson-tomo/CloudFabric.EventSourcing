@@ -48,6 +48,105 @@ public abstract class ProjectionRepository : IProjectionRepository
     protected readonly ILogger<ProjectionRepository> Logger;
     protected const string PROJECTION_INDEX_STATE_INDEX_NAME = "projection_index_state";
 
+    // Batch mode state — thread-safe via _batchLock
+    private volatile bool _isBatchMode;
+    private readonly object _batchLock = new();
+    private readonly List<BufferedUpsert> _upsertBuffer = new();
+    private readonly HashSet<(string Id, string PartitionKey)> _deleteBuffer = new();
+    private ProjectionOperationIndexDescriptor? _batchIndexDescriptor;
+    private ProjectionOperationIndexSelector _batchIndexSelector = ProjectionOperationIndexSelector.Write;
+
+    protected record BufferedUpsert(
+        string Id, Dictionary<string, object?> Document,
+        string PartitionKey, DateTime UpdatedAt);
+
+    public bool IsBatchMode => _isBatchMode;
+
+    /// <summary>
+    /// Enters batch mode. Subsequent Upsert/Delete calls will be buffered in memory.
+    /// Call <see cref="FlushBatchAsync"/> to write the buffer as a single bulk operation.
+    /// Call <see cref="EndBatch"/> to exit batch mode (discards unflushed data).
+    /// Thread-safe: buffer operations are protected by <see cref="_batchLock"/>.
+    /// </summary>
+    /// <param name="indexSelector">
+    /// Which index to write to when flushing. Use <see cref="ProjectionOperationIndexSelector.Write"/> for live/import
+    /// and <see cref="ProjectionOperationIndexSelector.ProjectionRebuild"/> for rebuild.
+    /// </param>
+    public void BeginBatch(ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write)
+    {
+        lock (_batchLock)
+        {
+            _isBatchMode = true;
+            _batchIndexSelector = indexSelector;
+            _upsertBuffer.Clear();
+            _deleteBuffer.Clear();
+            _batchIndexDescriptor = null;
+        }
+    }
+
+    /// <summary>
+    /// Exits batch mode and discards any unflushed buffered operations.
+    /// </summary>
+    public void EndBatch()
+    {
+        lock (_batchLock)
+        {
+            _isBatchMode = false;
+            _upsertBuffer.Clear();
+            _deleteBuffer.Clear();
+            _batchIndexDescriptor = null;
+        }
+    }
+
+    /// <summary>
+    /// Atomically copies the buffer, clears it, then writes all buffered operations
+    /// to the backing store via <see cref="FlushBufferAsync"/>. Deletes are applied first.
+    /// No-op when not in batch mode or buffer is empty.
+    /// </summary>
+    public async Task FlushBatchAsync(CancellationToken cancellationToken = default)
+    {
+        List<BufferedUpsert> items;
+        List<(string Id, string PartitionKey)> deletes;
+
+        lock (_batchLock)
+        {
+            if (_upsertBuffer.Count == 0 && _deleteBuffer.Count == 0) return;
+            items = new List<BufferedUpsert>(_upsertBuffer);
+            deletes = _deleteBuffer.ToList();
+            _upsertBuffer.Clear();
+            _deleteBuffer.Clear();
+        }
+
+        _batchIndexDescriptor ??= await GetIndexDescriptorForOperation(
+            _batchIndexSelector, cancellationToken);
+
+        // Deletes first, then bulk upsert
+        foreach (var (id, pk) in deletes)
+        {
+            await DeleteInternal(_batchIndexDescriptor, Guid.Parse(id), pk, cancellationToken);
+        }
+
+        if (items.Count > 0)
+        {
+            await FlushBufferAsync(_batchIndexDescriptor, items, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Backend-specific bulk write. Default implementation falls back to sequential <see cref="UpsertInternal"/> calls.
+    /// Override in backend implementations (PostgreSQL, ElasticSearch) for optimized bulk operations.
+    /// </summary>
+    protected virtual async Task FlushBufferAsync(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        IReadOnlyList<BufferedUpsert> items,
+        CancellationToken cancellationToken = default)
+    {
+        foreach (var item in items)
+        {
+            await UpsertInternal(indexDescriptor, item.Document, item.PartitionKey, item.UpdatedAt, cancellationToken);
+        }
+    }
+
     public ProjectionRepository(ProjectionDocumentSchema projectionDocumentSchema, ILogger<ProjectionRepository> logger)
     {
         ProjectionDocumentSchema = (ProjectionDocumentSchema)projectionDocumentSchema.Clone();
@@ -98,11 +197,34 @@ public abstract class ProjectionRepository : IProjectionRepository
     /// </summary>
     protected abstract Task DropIndex(string indexName, CancellationToken cancellationToken = default);
     
-    public abstract Task<Dictionary<string, object?>?> Single(
-        Guid id, 
-        string partitionKey, 
+    public async Task<Dictionary<string, object?>?> Single(
+        Guid id,
+        string partitionKey,
         CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.ReadOnly
+    )
+    {
+        // In batch mode, check buffer first for read-your-writes correctness
+        if (_isBatchMode)
+        {
+            lock (_batchLock)
+            {
+                var idStr = id.ToString();
+                if (_deleteBuffer.Contains((idStr, partitionKey))) return null;
+                var buffered = _upsertBuffer.FindLast(x => x.Id == idStr && x.PartitionKey == partitionKey);
+                if (buffered != null) return new Dictionary<string, object?>(buffered.Document);
+            }
+        }
+
+        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
+        return await SingleInternal(indexDescriptor, id, partitionKey, cancellationToken);
+    }
+
+    protected abstract Task<Dictionary<string, object?>?> SingleInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        Guid id,
+        string partitionKey,
+        CancellationToken cancellationToken = default
     );
 
     public async Task<ProjectionQueryResult<Dictionary<string, object?>>> Query(
@@ -111,6 +233,9 @@ public abstract class ProjectionRepository : IProjectionRepository
         CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.ReadOnly
     ) {
+        // Flush buffer before server-side query to ensure consistency
+        if (_isBatchMode) await FlushBatchAsync(cancellationToken);
+
         var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
         return await QueryInternal(indexDescriptor, projectionQuery, partitionKey, cancellationToken);
     }
@@ -130,6 +255,21 @@ public abstract class ProjectionRepository : IProjectionRepository
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
     )
     {
+        if (_isBatchMode)
+        {
+            lock (_batchLock)
+            {
+                var keyValue = document[ProjectionDocumentSchema.KeyColumnName]?.ToString()
+                    ?? throw new ArgumentException("Document key cannot be null");
+                // Remove from delete buffer if present
+                _deleteBuffer.Remove((keyValue, partitionKey));
+                // Replace existing buffered entry (last write wins)
+                _upsertBuffer.RemoveAll(x => x.Id == keyValue && x.PartitionKey == partitionKey);
+                _upsertBuffer.Add(new BufferedUpsert(keyValue, new Dictionary<string, object?>(document), partitionKey, updatedAt));
+            }
+            return;
+        }
+
         var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
         await UpsertInternal(indexDescriptor, document, partitionKey, updatedAt, cancellationToken);
     }
@@ -142,11 +282,33 @@ public abstract class ProjectionRepository : IProjectionRepository
         CancellationToken cancellationToken = default
     );
     
-    public abstract Task Delete(
-        Guid id, 
-        string partitionKey, 
-        CancellationToken cancellationToken = default, 
+    public async Task Delete(
+        Guid id,
+        string partitionKey,
+        CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
+    )
+    {
+        if (_isBatchMode)
+        {
+            lock (_batchLock)
+            {
+                var idStr = id.ToString();
+                _upsertBuffer.RemoveAll(x => x.Id == idStr && x.PartitionKey == partitionKey);
+                _deleteBuffer.Add((idStr, partitionKey));
+            }
+            return;
+        }
+
+        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
+        await DeleteInternal(indexDescriptor, id, partitionKey, cancellationToken);
+    }
+
+    protected abstract Task DeleteInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        Guid id,
+        string partitionKey,
+        CancellationToken cancellationToken = default
     );
     public abstract Task DeleteAll(
         string? partitionKey = null,
@@ -163,6 +325,9 @@ public abstract class ProjectionRepository : IProjectionRepository
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
     )
     {
+        // Flush buffer before server-side update to ensure consistency
+        if (_isBatchMode) await FlushBatchAsync(cancellationToken);
+
         var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
         return await UpdateByQueryInternal(indexDescriptor, query, partitionKey, propertyUpdates, updatedAt, cancellationToken);
     }

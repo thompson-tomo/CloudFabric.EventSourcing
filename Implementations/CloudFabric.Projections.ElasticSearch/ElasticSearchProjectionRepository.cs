@@ -229,15 +229,13 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         await _client.Indices.DeleteAsync(new DeleteIndexRequest(indexName), cancellationToken);
     }
 
-    public override async Task<Dictionary<string, object?>?> Single(
+    protected override async Task<Dictionary<string, object?>?> SingleInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
         Guid id,
         string partitionKey,
-        CancellationToken cancellationToken = default,
-        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.ReadOnly
+        CancellationToken cancellationToken = default
     )
     {
-        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
-
         try
         {
             var item = await _client.GetAsync<Dictionary<string, object?>>(
@@ -264,15 +262,13 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         }
     }
 
-    public override async Task Delete(
+    protected override async Task DeleteInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
         Guid id,
         string partitionKey,
-        CancellationToken cancellationToken = default,
-        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
+        CancellationToken cancellationToken = default
     )
     {
-        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
-
         try
         {
             await _client.DeleteAsync(
@@ -377,6 +373,53 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
                 "Failed to upsert Document with {@Id} ({@Index})", document[_projectionDocumentSchema.KeyColumnName], indexDescriptor.IndexName
             );
 
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Bulk upsert using ElasticSearch _bulk API — single HTTP request for all documents.
+    /// </summary>
+    protected override async Task FlushBufferAsync(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        IReadOnlyList<BufferedUpsert> items,
+        CancellationToken cancellationToken = default)
+    {
+        if (items.Count == 0) return;
+
+        var bulkDescriptor = new BulkDescriptor()
+            .Index(indexDescriptor.IndexName)
+            .Refresh(Refresh.False);
+
+        foreach (var item in items)
+        {
+            var doc = item.Document;
+            doc[nameof(ProjectionDocument.PartitionKey)] = item.PartitionKey;
+            doc[nameof(ProjectionDocument.UpdatedAt)] = item.UpdatedAt;
+
+            bulkDescriptor.Index<Dictionary<string, object?>>(op => op
+                .Document(doc)
+                .Id(item.Id)
+                .Routing(new Routing(item.PartitionKey))
+            );
+        }
+
+        try
+        {
+            var response = await _client.BulkAsync(bulkDescriptor, cancellationToken);
+
+            if (response.Errors)
+            {
+                var firstError = response.ItemsWithErrors.FirstOrDefault();
+                throw new Exception(
+                    $"ElasticSearch _bulk operation had errors on \"{indexDescriptor.IndexName}\". " +
+                    $"First error: {firstError?.Error?.Type} - {firstError?.Error?.Reason}"
+                );
+            }
+        }
+        catch (Exception ex) when (ex is not Exception { Message: var m } || !m.StartsWith("ElasticSearch _bulk"))
+        {
+            _logger.LogError(ex, "FlushBufferAsync failed on ({@Index})", indexDescriptor.IndexName);
             throw;
         }
     }

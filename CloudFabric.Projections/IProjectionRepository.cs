@@ -59,6 +59,34 @@ public interface IProjectionRepository
         CancellationToken cancellationToken = default,
         ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
     );
+
+    /// <summary>
+    /// Enters batch mode. Subsequent Upsert/Delete calls will be buffered instead of writing immediately.
+    /// Call <see cref="FlushBatchAsync"/> to write all buffered operations as a single bulk operation.
+    /// Thread-safe: can be used concurrently with live event processing.
+    /// </summary>
+    /// <param name="indexSelector">
+    /// Which index to target when flushing. Defaults to <see cref="ProjectionOperationIndexSelector.Write"/>.
+    /// Use <see cref="ProjectionOperationIndexSelector.ProjectionRebuild"/> during rebuild.
+    /// </param>
+    void BeginBatch(ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write);
+
+    /// <summary>
+    /// Writes all buffered documents to the backing store using a backend-specific bulk operation
+    /// (PostgreSQL: multi-row INSERT ON CONFLICT, ElasticSearch: _bulk API), then clears the buffer.
+    /// No-op if not in batch mode or buffer is empty.
+    /// </summary>
+    Task FlushBatchAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Exits batch mode and discards any unflushed documents.
+    /// </summary>
+    void EndBatch();
+
+    /// <summary>
+    /// Returns true if the repository is currently in batch mode.
+    /// </summary>
+    bool IsBatchMode { get; }
 }
 
 public interface IProjectionRepository<TDocument> : IProjectionRepository

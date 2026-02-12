@@ -8,6 +8,7 @@ public class OrdersListProjectionBuilder : ProjectionBuilder<OrderListProjection
     IHandleEvent<OrderPlaced>,
     IHandleEvent<OrderItemAdded>,
     IHandleEvent<OrderItemRemoved>,
+    IHandleEvent<OrderNameUpdated>,
     IHandleEvent<AggregateUpdatedEvent<Order>>,
     IHandleCrossAggregateEvent<BulkOrderTagChanged>
 {
@@ -80,6 +81,17 @@ public class OrdersListProjectionBuilder : ProjectionBuilder<OrderListProjection
         };
 
         await UpsertDocument(projectionItem, evt.PartitionKey, evt.Timestamp);
+    }
+
+    public async Task On(OrderNameUpdated evt)
+    {
+        await UpdateDocument(evt.AggregateId,
+            evt.PartitionKey,
+            evt.Timestamp,
+            (orderProjection) =>
+            {
+                orderProjection.Name = evt.NewOrderName;
+            });
     }
 
     public async Task On(AggregateUpdatedEvent<Order> evt)

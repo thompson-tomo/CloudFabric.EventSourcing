@@ -138,6 +138,51 @@ public class AggregateRepository<T> : IAggregateRepository<T> where T : Aggregat
     }
 
     /// <summary>
+    /// Batch-saves multiple NEW aggregates via <see cref="IEventStore.AppendNewStreamsAsync"/>.
+    /// All aggregates must be new (version 0). Events are committed in a single transaction,
+    /// then handlers are notified for projection building.
+    /// </summary>
+    public async Task SaveMultipleNewAsync(
+        EventUserInfo eventUserInfo,
+        IReadOnlyList<T> aggregates,
+        CancellationToken cancellationToken = default)
+    {
+        var streams = aggregates.Select(a =>
+        {
+            foreach (var e in a.UncommittedEvents)
+            {
+                e.AggregateType = a.GetType().AssemblyQualifiedName ?? "";
+            }
+            return (a.Id, a.PartitionKey, (IReadOnlyList<IEvent>)a.UncommittedEvents.ToList());
+        }).ToList();
+
+        await _eventStore.AppendNewStreamsAsync(eventUserInfo, streams, cancellationToken);
+
+        foreach (var a in aggregates)
+        {
+            a.OnChangesSaved();
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task AppendEventsToMultipleAsync(
+        EventUserInfo eventUserInfo,
+        IReadOnlyList<(Guid StreamId, string PartitionKey, IReadOnlyList<IEvent> Events)> streams,
+        CancellationToken cancellationToken = default)
+    {
+        var aggregateType = typeof(T).AssemblyQualifiedName ?? "";
+        foreach (var (_, _, events) in streams)
+        {
+            foreach (var e in events)
+            {
+                e.AggregateType = aggregateType;
+            }
+        }
+
+        await _eventStore.AppendToMultipleExistingStreamsAsync(eventUserInfo, streams, cancellationToken);
+    }
+
+    /// <summary>
     /// We should not be able to hard delete events within implementation, but for some development issues we do need to be able to do so.
     /// Use this method carefully and at your own risk. When something went terribly wrong, there is no way to recover deleted data.
     /// </summary>

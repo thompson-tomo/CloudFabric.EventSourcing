@@ -7,7 +7,9 @@ using CloudFabric.EventSourcing.Tests.Domain.Projections.OrdersListProjection;
 using CloudFabric.EventSourcing.Tests.Domain.ValueObjects;
 using CloudFabric.Projections;
 using CloudFabric.Projections.Queries;
+using CloudFabric.Projections.Worker;
 using FluentAssertions;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
 namespace CloudFabric.EventSourcing.Tests;
@@ -1085,6 +1087,571 @@ public abstract class OrderTests : TestsBaseWithProjections<OrderListProjectionI
         rebuiltProj.Should().NotBeNull();
         rebuiltProj!.Tag.Should().Be("REBUILT_TAG");
         rebuiltProj.Name.Should().Be("Rebuild Cross-Agg Order");
+    }
+
+    #endregion
+
+    #region Batch Mode Tests
+
+    [TestMethod]
+    public async Task TestBatchUpsert_ReadYourWrites()
+    {
+        var orderRepository = new AggregateRepository<Order>(await GetEventStore());
+        var factory = GetProjectionRepositoryFactory();
+        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Create order and wait for projection
+        var order = new Order(Guid.NewGuid(), "Batch RYW Order", new List<OrderItem>(), userId, "john@gmail.com");
+        await orderRepository.SaveAsync(userInfo, order);
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Enable batch mode
+        factory.BeginBatchOnAll();
+        try
+        {
+            // Add item triggers Single (read) then Upsert (write) in builder
+            order.AddItem(new OrderItem(DateTime.UtcNow, "TestItem", 10.00m));
+            await orderRepository.SaveAsync(userInfo, order);
+            await Task.Delay(ProjectionsUpdateDelay);
+
+            // In batch mode, the projection should be in the buffer
+            // Single() should see the buffered version (read-your-writes)
+            var projInBuffer = await repo.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
+            projInBuffer.Should().NotBeNull();
+            projInBuffer!.ItemsCount.Should().Be(1);
+
+            // Flush and verify it's persisted
+            await factory.FlushBatchOnAllAsync();
+        }
+        finally
+        {
+            factory.EndBatchOnAll();
+        }
+
+        var proj = await repo.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
+        proj.Should().NotBeNull();
+        proj!.ItemsCount.Should().Be(1);
+    }
+
+    [TestMethod]
+    public async Task TestBatchUpsert_DeleteInBatch()
+    {
+        var orderRepository = new AggregateRepository<Order>(await GetEventStore());
+        var factory = GetProjectionRepositoryFactory();
+        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Create two orders
+        var order1 = new Order(Guid.NewGuid(), "Delete Batch Order 1", new List<OrderItem>(), userId, "john@gmail.com");
+        var order2 = new Order(Guid.NewGuid(), "Delete Batch Order 2", new List<OrderItem>(), userId, "john@gmail.com");
+        await orderRepository.SaveAsync(userInfo, order1);
+        await orderRepository.SaveAsync(userInfo, order2);
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Enable batch, delete one order
+        factory.BeginBatchOnAll();
+        try
+        {
+            await repo.Delete(order1.Id, PartitionKeys.GetOrderPartitionKey());
+
+            // In batch: deleted order should not be visible via Single
+            var deletedProj = await repo.Single(order1.Id, PartitionKeys.GetOrderPartitionKey());
+            deletedProj.Should().BeNull();
+
+            // Non-deleted order still visible
+            var existingProj = await repo.Single(order2.Id, PartitionKeys.GetOrderPartitionKey());
+            existingProj.Should().NotBeNull();
+
+            await factory.FlushBatchOnAllAsync();
+        }
+        finally
+        {
+            factory.EndBatchOnAll();
+        }
+
+        // After flush, verify deletion persisted
+        var proj1 = await repo.Single(order1.Id, PartitionKeys.GetOrderPartitionKey());
+        proj1.Should().BeNull();
+
+        var proj2 = await repo.Single(order2.Id, PartitionKeys.GetOrderPartitionKey());
+        proj2.Should().NotBeNull();
+    }
+
+    [TestMethod]
+    public async Task TestBatchUpsert_MultipleOrdersFlushed()
+    {
+        var orderRepository = new AggregateRepository<Order>(await GetEventStore());
+        var factory = GetProjectionRepositoryFactory();
+        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        factory.BeginBatchOnAll();
+        try
+        {
+            // Create 10 orders in batch mode
+            for (int i = 0; i < 10; i++)
+            {
+                var order = new Order(Guid.NewGuid(), $"Batch Order {i}", new List<OrderItem>(), userId, "john@gmail.com");
+                await orderRepository.SaveAsync(userInfo, order);
+            }
+
+            await Task.Delay(ProjectionsUpdateDelay);
+            await factory.FlushBatchOnAllAsync();
+        }
+        finally
+        {
+            factory.EndBatchOnAll();
+        }
+
+        // Allow ES to refresh after flush
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // All 10 orders should be queryable
+        var results = await repo.Query(new ProjectionQuery() { Limit = 20 });
+        results.TotalRecordsFound.Should().Be(10);
+    }
+
+    [TestMethod]
+    public async Task TestSaveMultipleNewAsync()
+    {
+        var eventStore = await GetEventStore();
+        var orderRepository = new AggregateRepository<Order>(eventStore);
+        var factory = GetProjectionRepositoryFactory();
+        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Enable batch mode so that handler-triggered upserts are buffered
+        factory.BeginBatchOnAll();
+        try
+        {
+            var orders = new List<Order>();
+            for (int i = 0; i < 5; i++)
+            {
+                orders.Add(new Order(Guid.NewGuid(), $"Bulk Order {i}", new List<OrderItem>(), userId, "john@gmail.com"));
+            }
+
+            await orderRepository.SaveMultipleNewAsync(userInfo, orders);
+            await Task.Delay(ProjectionsUpdateDelay);
+            await factory.FlushBatchOnAllAsync();
+        }
+        finally
+        {
+            factory.EndBatchOnAll();
+        }
+
+        // Allow ES to refresh after flush
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // All 5 orders should be persisted in event store and projections
+        var results = await repo.Query(new ProjectionQuery() { Limit = 20 });
+        results.TotalRecordsFound.Should().Be(5);
+
+        // Verify events are in the event store
+        for (int i = 0; i < 5; i++)
+        {
+            var loaded = await repo.Query(new ProjectionQuery
+            {
+                Filters = new List<Filter>
+                {
+                    new Filter(nameof(OrderListProjectionItem.Name), FilterOperator.Equal, $"Bulk Order {i}")
+                }
+            });
+            loaded.TotalRecordsFound.Should().Be(1);
+        }
+    }
+
+    [TestMethod]
+    public async Task TestBatchRebuild()
+    {
+        var orderRepository = new AggregateRepository<Order>(await GetEventStore());
+        var factory = GetProjectionRepositoryFactory();
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Create orders normally
+        for (int i = 0; i < 5; i++)
+        {
+            var order = new Order(Guid.NewGuid(), $"Rebuild Order {i}", new List<OrderItem>(), userId, "john@gmail.com");
+            await orderRepository.SaveAsync(userInfo, order);
+        }
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Verify all projections exist
+        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
+        var results = await repo.Query(new ProjectionQuery() { Limit = 20 });
+        results.TotalRecordsFound.Should().Be(5);
+
+        // Delete projections and rebuild with batch mode
+        await repo.DeleteAll();
+        await repo.EnsureIndex();
+
+        // Create a new RebuildProcessor with factory for batch mode
+        var rebuildProcessor = new ProjectionsRebuildProcessor(
+            factory.GetProjectionsIndexStateRepository(),
+            async (string connectionId) =>
+            {
+                var rebuildEngine = new ProjectionsEngine(GetEventStoreEventsObserver());
+                var builder = new OrdersListProjectionBuilder(factory, ProjectionOperationIndexSelector.ProjectionRebuild);
+                rebuildEngine.AddProjectionBuilder(builder);
+                return rebuildEngine;
+            },
+            NullLogger<ProjectionsRebuildProcessor>.Instance,
+            factory
+        );
+
+        await rebuildProcessor.RebuildProjectionsThatRequireRebuild();
+
+        // Allow ES to refresh after rebuild flush
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // All 5 projections should be rebuilt
+        results = await repo.Query(new ProjectionQuery() { Limit = 20 });
+        results.TotalRecordsFound.Should().Be(5);
+    }
+
+    #endregion
+
+    #region Batch Performance Tests
+
+    [TestMethod]
+    public async Task TestBatchImport_Performance()
+    {
+        const int totalAggregates = 10_000;
+        const int chunkSize = 1000;
+        const int itemsPerOrder = 3;
+
+        var eventStore = await GetEventStore();
+        var factory = GetProjectionRepositoryFactory();
+        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
+        var orderRepository = new AggregateRepository<Order>(eventStore);
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // --- Phase 1: Chunked batch import (realistic scenario) ---
+        factory.BeginBatchOnAll();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var eventStoreTotal = TimeSpan.Zero;
+        var projectionFlushTotal = TimeSpan.Zero;
+        var objectCreationTotal = TimeSpan.Zero;
+
+        for (int chunk = 0; chunk < totalAggregates; chunk += chunkSize)
+        {
+            var chunkSw = System.Diagnostics.Stopwatch.StartNew();
+            var currentChunkSize = Math.Min(chunkSize, totalAggregates - chunk);
+            var orders = new List<Order>(currentChunkSize);
+            for (int i = 0; i < currentChunkSize; i++)
+            {
+                var idx = chunk + i;
+                var items = Enumerable.Range(0, itemsPerOrder)
+                    .Select(j => new OrderItem(DateTime.UtcNow, $"Item {j} of order {idx}", 10.0m + j))
+                    .ToList();
+                orders.Add(new Order(Guid.NewGuid(), $"Perf Order {idx}", items, userId, $"user{idx}@test.com"));
+            }
+            objectCreationTotal += chunkSw.Elapsed;
+
+            chunkSw.Restart();
+            // SaveMultipleNewAsync = event store insert + handler notification (buffered upserts)
+            await orderRepository.SaveMultipleNewAsync(userInfo, orders);
+            eventStoreTotal += chunkSw.Elapsed;
+
+            chunkSw.Restart();
+            await factory.FlushBatchOnAllAsync();
+            projectionFlushTotal += chunkSw.Elapsed;
+        }
+
+        var batchTotalElapsed = sw.Elapsed;
+        factory.EndBatchOnAll();
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Verify all projections written
+        var results = await repo.Query(new ProjectionQuery() { Limit = 1 });
+        results.TotalRecordsFound.Should().Be(totalAggregates);
+
+        // --- Phase 2: Rebuild from scratch ---
+        await repo.DeleteAll();
+        await repo.EnsureIndex();
+
+        var rebuildProcessor = new ProjectionsRebuildProcessor(
+            factory.GetProjectionsIndexStateRepository(),
+            async (string connectionId) =>
+            {
+                var rebuildEngine = new ProjectionsEngine(GetEventStoreEventsObserver());
+                var builder = new OrdersListProjectionBuilder(factory, ProjectionOperationIndexSelector.ProjectionRebuild);
+                rebuildEngine.AddProjectionBuilder(builder);
+                return rebuildEngine;
+            },
+            NullLogger<ProjectionsRebuildProcessor>.Instance,
+            factory
+        );
+
+        sw.Restart();
+        await rebuildProcessor.RebuildProjectionsThatRequireRebuild();
+        var rebuildElapsed = sw.Elapsed;
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        results = await repo.Query(new ProjectionQuery() { Limit = 1 });
+        results.TotalRecordsFound.Should().Be(totalAggregates);
+
+        // --- Phase 3: Sequential insert for comparison (smaller sample) ---
+        const int sequentialCount = 200;
+        await eventStore.DeleteAll();
+        await repo.DeleteAll();
+        await repo.EnsureIndex();
+
+        sw.Restart();
+        for (int i = 0; i < sequentialCount; i++)
+        {
+            var items = Enumerable.Range(0, itemsPerOrder)
+                .Select(j => new OrderItem(DateTime.UtcNow, $"Seq Item {j}", 5.0m + j))
+                .ToList();
+            var order = new Order(Guid.NewGuid(), $"Seq Order {i}", items, userId, $"seq{i}@test.com");
+            await orderRepository.SaveAsync(userInfo, order);
+        }
+        var sequentialElapsed = sw.Elapsed;
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        results = await repo.Query(new ProjectionQuery() { Limit = 1 });
+        results.TotalRecordsFound.Should().Be(sequentialCount);
+
+        var seqPerAgg = sequentialElapsed.TotalMilliseconds / sequentialCount;
+        var estimatedSequential = seqPerAgg * totalAggregates;
+
+        // Output timing results
+        Console.WriteLine($"=== Batch Performance Test ({totalAggregates} aggregates, {itemsPerOrder} items each, chunks of {chunkSize}) ===");
+        Console.WriteLine($"Object creation:             {objectCreationTotal.TotalMilliseconds:F0}ms");
+        Console.WriteLine($"Event store + handlers:      {eventStoreTotal.TotalMilliseconds:F0}ms");
+        Console.WriteLine($"Projection flush:            {projectionFlushTotal.TotalMilliseconds:F0}ms");
+        Console.WriteLine($"Batch import total:          {batchTotalElapsed.TotalMilliseconds:F0}ms ({totalAggregates / batchTotalElapsed.TotalSeconds:F0} agg/s)");
+        Console.WriteLine($"Rebuild:                     {rebuildElapsed.TotalMilliseconds:F0}ms ({totalAggregates / rebuildElapsed.TotalSeconds:F0} agg/s)");
+        Console.WriteLine($"Sequential insert ({sequentialCount} agg):    {sequentialElapsed.TotalMilliseconds:F0}ms ({sequentialCount / sequentialElapsed.TotalSeconds:F0} agg/s)");
+        Console.WriteLine($"Estimated sequential {totalAggregates}:     {estimatedSequential:F0}ms");
+        Console.WriteLine($"Batch speedup:               {estimatedSequential / batchTotalElapsed.TotalMilliseconds:F1}x");
+        Console.WriteLine($"--- Extrapolation to 1M aggregates ---");
+        Console.WriteLine($"Batch (estimated):           {batchTotalElapsed.TotalMilliseconds / totalAggregates * 1_000_000 / 1000:F0}s");
+        Console.WriteLine($"Sequential (estimated):      {seqPerAgg * 1_000_000 / 1000:F0}s ({seqPerAgg * 1_000_000 / 3600000:F1}h)");
+    }
+
+    [TestMethod]
+    public virtual async Task TestBatchUpdateExisting()
+    {
+        var eventStore = await GetEventStore();
+        var orderRepository = new AggregateRepository<Order>(eventStore);
+        var factory = GetProjectionRepositoryFactory();
+        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // 1. Create 100 orders via batch insert
+        factory.BeginBatchOnAll();
+        var orders = new List<Order>();
+        for (int i = 0; i < 100; i++)
+        {
+            var items = new List<OrderItem>
+            {
+                new OrderItem(DateTime.UtcNow, $"Item of order {i}", 10.0m + i)
+            };
+            orders.Add(new Order(Guid.NewGuid(), $"Order {i}", items, userId, $"user{i}@test.com"));
+        }
+        await orderRepository.SaveMultipleNewAsync(userInfo, orders);
+        await factory.FlushBatchOnAllAsync();
+        factory.EndBatchOnAll();
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Verify all 100 created
+        var results = await repo.Query(new ProjectionQuery() { Limit = 1 });
+        results.TotalRecordsFound.Should().Be(100);
+
+        // 2. "Excel update": compare with projections, update every other order
+        factory.BeginBatchOnAll();
+        try
+        {
+            var updates = new List<(Guid StreamId, string PartitionKey, IReadOnlyList<IEvent> Events)>();
+
+            for (int i = 0; i < orders.Count; i++)
+            {
+                var order = orders[i];
+                var newName = $"Updated Order {i}";
+
+                // Compare with current projection (simulating Excel import)
+                var currentProjection = await repo.Single(order.Id, order.PartitionKey);
+                currentProjection.Should().NotBeNull();
+
+                var currentName = currentProjection!.Name;
+                if (i % 2 == 0 && currentName != newName)
+                {
+                    updates.Add((
+                        order.Id,
+                        order.PartitionKey,
+                        new List<IEvent> { new OrderNameUpdated(order.Id, newName, order.PartitionKey) }
+                    ));
+                }
+            }
+
+            updates.Count.Should().Be(50);
+
+            await orderRepository.AppendEventsToMultipleAsync(userInfo, updates);
+            await factory.FlushBatchOnAllAsync();
+        }
+        finally
+        {
+            factory.EndBatchOnAll();
+        }
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // 3. Verify: 100 total, 50 updated, 50 unchanged
+        results = await repo.Query(new ProjectionQuery() { Limit = 200 });
+        results.TotalRecordsFound.Should().Be(100);
+
+        var updatedCount = results.Records
+            .Count(r => r.Document!.Name.StartsWith("Updated Order"));
+        updatedCount.Should().Be(50);
+
+        var unchangedCount = results.Records
+            .Count(r => r.Document!.Name.StartsWith("Order "));
+        unchangedCount.Should().Be(50);
+
+        // 4. Verify aggregate state: load one updated order
+        var updatedOrder = orders[0]; // i=0, should be updated
+        var loadedStream = await eventStore.LoadStreamAsync(updatedOrder.Id, updatedOrder.PartitionKey);
+        var loadedOrder = new Order(loadedStream.Events);
+        loadedOrder.OrderName.Should().Be("Updated Order 0");
+
+        // 5. Verify aggregate state: load one unchanged order
+        var unchangedOrder = orders[1]; // i=1, should be unchanged
+        loadedStream = await eventStore.LoadStreamAsync(unchangedOrder.Id, unchangedOrder.PartitionKey);
+        loadedOrder = new Order(loadedStream.Events);
+        loadedOrder.OrderName.Should().Be("Order 1");
+    }
+
+    [TestMethod]
+    public virtual async Task TestBatchUpdate_Performance()
+    {
+        var eventStore = await GetEventStore();
+        var orderRepository = new AggregateRepository<Order>(eventStore);
+        var factory = GetProjectionRepositoryFactory();
+        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        const int totalAggregates = 10_000;
+        const int updateCount = 5_000;
+        const int chunkSize = 1000;
+
+        // 1. Create orders via batch insert
+        factory.BeginBatchOnAll();
+        var orders = new List<Order>(totalAggregates);
+        for (int i = 0; i < totalAggregates; i++)
+        {
+            var items = new List<OrderItem>
+            {
+                new OrderItem(DateTime.UtcNow, $"Item {i}", 10.0m)
+            };
+            orders.Add(new Order(Guid.NewGuid(), $"Order {i}", items, userId, $"user{i}@test.com"));
+        }
+
+        foreach (var chunk in orders.Chunk(chunkSize))
+        {
+            await orderRepository.SaveMultipleNewAsync(userInfo, chunk.ToList());
+            await factory.FlushBatchOnAllAsync();
+        }
+        factory.EndBatchOnAll();
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // 2. Batch update first N orders
+        var ordersToUpdate = orders.Take(updateCount).ToList();
+
+        factory.BeginBatchOnAll();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var eventStoreTotal = TimeSpan.Zero;
+        var projectionFlushTotal = TimeSpan.Zero;
+
+        try
+        {
+            foreach (var chunk in ordersToUpdate.Chunk(chunkSize))
+            {
+                var updates = chunk.Select(o => (
+                    StreamId: o.Id,
+                    PartitionKey: o.PartitionKey,
+                    Events: (IReadOnlyList<IEvent>)new List<IEvent>
+                    {
+                        new OrderNameUpdated(o.Id, $"Updated {o.OrderName}", o.PartitionKey)
+                    }
+                )).ToList();
+
+                var chunkSw = System.Diagnostics.Stopwatch.StartNew();
+                await orderRepository.AppendEventsToMultipleAsync(userInfo, updates);
+                eventStoreTotal += chunkSw.Elapsed;
+
+                chunkSw.Restart();
+                await factory.FlushBatchOnAllAsync();
+                projectionFlushTotal += chunkSw.Elapsed;
+            }
+        }
+        finally
+        {
+            factory.EndBatchOnAll();
+        }
+        var batchUpdateElapsed = sw.Elapsed;
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Verify
+        var results = await repo.Query(new ProjectionQuery() { Limit = 1 });
+        results.TotalRecordsFound.Should().Be(totalAggregates);
+
+        // 3. Sequential update for comparison (small sample)
+        const int sequentialCount = 100;
+        var aggregateType = typeof(Order).AssemblyQualifiedName ?? "";
+        sw.Restart();
+        for (int i = updateCount; i < updateCount + sequentialCount && i < totalAggregates; i++)
+        {
+            var o = orders[i];
+            var loaded = new Order(
+                (await eventStore.LoadStreamAsync(o.Id, o.PartitionKey)).Events
+            );
+            var evt = new OrderNameUpdated(o.Id, $"Seq Updated {o.OrderName}", o.PartitionKey);
+            evt.AggregateType = aggregateType;
+            await eventStore.AppendToStreamAsync(
+                userInfo, o.Id, loaded.Version,
+                new List<IEvent> { evt }
+            );
+        }
+        var sequentialElapsed = sw.Elapsed;
+
+        var seqPerAgg = sequentialElapsed.TotalMilliseconds / sequentialCount;
+        var estimatedSequential = seqPerAgg * updateCount;
+
+        // Output timing results
+        Console.WriteLine($"=== Batch Update Performance Test ({updateCount}/{totalAggregates} aggregates) ===");
+        Console.WriteLine($"Event store + handlers:      {eventStoreTotal.TotalMilliseconds:F0}ms");
+        Console.WriteLine($"Projection flush:            {projectionFlushTotal.TotalMilliseconds:F0}ms");
+        Console.WriteLine($"Batch update total:          {batchUpdateElapsed.TotalMilliseconds:F0}ms ({updateCount / batchUpdateElapsed.TotalSeconds:F0} agg/s)");
+        Console.WriteLine($"Sequential update ({sequentialCount} agg):   {sequentialElapsed.TotalMilliseconds:F0}ms ({sequentialCount / sequentialElapsed.TotalSeconds:F0} agg/s)");
+        Console.WriteLine($"Estimated sequential {updateCount}:    {estimatedSequential:F0}ms");
+        Console.WriteLine($"Batch speedup:               {estimatedSequential / batchUpdateElapsed.TotalMilliseconds:F1}x");
+        Console.WriteLine($"--- Extrapolation to 1M updates ---");
+        Console.WriteLine($"Batch (estimated):           {batchUpdateElapsed.TotalMilliseconds / updateCount * 1_000_000 / 1000:F0}s");
+        Console.WriteLine($"Sequential (estimated):      {seqPerAgg * 1_000_000 / 1000:F0}s ({seqPerAgg * 1_000_000 / 3600000:F1}h)");
     }
 
     #endregion

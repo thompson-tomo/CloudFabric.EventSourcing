@@ -6,7 +6,7 @@ public record BulkOrderTagChanged : CrossAggregateEvent
 {
     public BulkOrderTagChanged() { }
 
-    public BulkOrderTagChanged(string aggregateType, string newTag, string? targetPartitionKey = null)
+    public BulkOrderTagChanged(string aggregateType, string newTag, string targetPartitionKey)
     {
         AggregateType = aggregateType;
         NewTag = newTag;

@@ -414,4 +414,22 @@ public class CosmosDbEventStore : IEventStore
     {
         throw new NotImplementedException("Cross-aggregate events are not yet supported for CosmosDb backend.");
     }
+
+    public Task AppendNewStreamsAsync(
+        EventUserInfo eventUserInfo,
+        IReadOnlyList<(Guid StreamId, string PartitionKey, IReadOnlyList<IEvent> Events)> streams,
+        CancellationToken cancellationToken = default
+    )
+    {
+        throw new NotImplementedException("Batch insert is not yet supported for CosmosDb backend.");
+    }
+
+    public Task AppendToMultipleExistingStreamsAsync(
+        EventUserInfo eventUserInfo,
+        IReadOnlyList<(Guid StreamId, string PartitionKey, IReadOnlyList<IEvent> Events)> streams,
+        CancellationToken cancellationToken = default
+    )
+    {
+        throw new NotImplementedException("Batch update is not yet supported for CosmosDb backend.");
+    }
 }

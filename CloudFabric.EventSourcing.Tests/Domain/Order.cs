@@ -75,6 +75,12 @@ public class Order : AggregateBase
         UpdatedAt = @event.Timestamp;
     }
 
+    public void On(OrderNameUpdated @event)
+    {
+        OrderName = @event.NewOrderName;
+        UpdatedAt = @event.Timestamp;
+    }
+
     public void On(BulkOrderTagChanged @event)
     {
         Tag = @event.NewTag;

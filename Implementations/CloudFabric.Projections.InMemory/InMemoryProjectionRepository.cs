@@ -105,39 +105,37 @@ public class InMemoryProjectionRepository : ProjectionRepository
         return Task.CompletedTask;
     }
 
-    public override async Task<Dictionary<string, object?>?> Single(
+    protected override Task<Dictionary<string, object?>?> SingleInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
         Guid id,
         string partitionKey,
-        CancellationToken cancellationToken = default,
-        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.ReadOnly
+        CancellationToken cancellationToken = default
     ) {
-        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
-
         if (!_storage.TryGetValue(indexDescriptor.IndexName, out var storage))
         {
-            return null;
+            return Task.FromResult<Dictionary<string, object?>?>(null);
         }
 
         if (storage.TryGetValue((id.ToString(), partitionKey), out var document))
         {
-            return new Dictionary<string, object?>(document);
+            return Task.FromResult<Dictionary<string, object?>?>(new Dictionary<string, object?>(document));
         }
 
-        return null;
+        return Task.FromResult<Dictionary<string, object?>?>(null);
     }
 
-    public override async Task Delete(
+    protected override Task DeleteInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
         Guid id,
         string partitionKey,
-        CancellationToken cancellationToken = default,
-        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
+        CancellationToken cancellationToken = default
     ) {
-        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
-
         if (_storage.TryGetValue(indexDescriptor.IndexName, out var storage))
         {
             storage.TryRemove((id.ToString(), partitionKey), out _);
         }
+
+        return Task.CompletedTask;
     }
 
     public override async Task DeleteAll(

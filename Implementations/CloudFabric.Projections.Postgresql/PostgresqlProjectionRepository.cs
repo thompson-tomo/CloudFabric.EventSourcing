@@ -203,11 +203,11 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public override async Task<Dictionary<string, object?>?> Single(
+    protected override async Task<Dictionary<string, object?>?> SingleInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
         Guid id,
         string partitionKey,
-        CancellationToken cancellationToken = default,
-        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.ReadOnly
+        CancellationToken cancellationToken = default
     ) {
         if (id == Guid.Empty)
         {
@@ -218,9 +218,7 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         {
             throw new ArgumentNullException(nameof(partitionKey));
         }
-        
-        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
-        
+
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);
 
@@ -310,11 +308,11 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         return null;
     }
 
-    public override async Task Delete(
-        Guid id, 
-        string partitionKey, 
-        CancellationToken cancellationToken = default,
-        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
+    protected override async Task DeleteInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        Guid id,
+        string partitionKey,
+        CancellationToken cancellationToken = default
     ) {
         if (id == Guid.Empty)
         {
@@ -325,9 +323,7 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         {
             throw new ArgumentNullException(nameof(partitionKey));
         }
-        
-        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
-        
+
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(cancellationToken);
 
@@ -478,6 +474,93 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         }
     }
     
+    /// <summary>
+    /// Bulk upsert using multi-row INSERT ... ON CONFLICT DO UPDATE SET ... = EXCLUDED.
+    /// Sub-batches by PostgreSQL parameter limit (~65535 params).
+    /// </summary>
+    protected override async Task FlushBufferAsync(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        IReadOnlyList<BufferedUpsert> items,
+        CancellationToken cancellationToken = default)
+    {
+        if (items.Count == 0) return;
+
+        var propertiesToInsert = indexDescriptor.ProjectionDocumentSchema.Properties;
+        var propertyNames = propertiesToInsert.Select(p => p.PropertyName).ToArray();
+        var keyColumnName = indexDescriptor.ProjectionDocumentSchema.KeyColumnName;
+
+        // PostgreSQL max parameters ~65535; sub-batch to stay within limits
+        var maxParamsPerRow = propertyNames.Length;
+        var maxRowsPerBatch = maxParamsPerRow > 0 ? Math.Max(1, 65000 / maxParamsPerRow) : items.Count;
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        for (var offset = 0; offset < items.Count; offset += maxRowsPerBatch)
+        {
+            var batchSlice = items.Skip(offset).Take(maxRowsPerBatch).ToList();
+
+            var sb = new StringBuilder();
+            sb.Append($"INSERT INTO \"{indexDescriptor.IndexName}\" ({string.Join(',', propertyNames)}) VALUES ");
+
+            var allParams = new List<NpgsqlParameter>();
+
+            for (var rowIdx = 0; rowIdx < batchSlice.Count; rowIdx++)
+            {
+                var item = batchSlice[rowIdx];
+                var doc = item.Document;
+                doc[nameof(ProjectionDocument.PartitionKey)] = item.PartitionKey;
+                doc[nameof(ProjectionDocument.UpdatedAt)] = item.UpdatedAt;
+
+                if (rowIdx > 0) sb.Append(',');
+                sb.Append('(');
+
+                for (var colIdx = 0; colIdx < propertiesToInsert.Count; colIdx++)
+                {
+                    var prop = propertiesToInsert[colIdx];
+                    var paramName = $"{prop.PropertyName}_{rowIdx}";
+
+                    if (colIdx > 0) sb.Append(',');
+                    sb.Append($"@{paramName}");
+
+                    var value = doc.TryGetValue(prop.PropertyName, out var v) ? v : null;
+
+                    if (prop.IsNestedObject || prop.IsNestedArray)
+                    {
+                        value = JsonSerializer.SerializeToDocument(value);
+                    }
+
+                    allParams.Add(new NpgsqlParameter(paramName, value ?? DBNull.Value));
+                }
+
+                sb.Append(')');
+            }
+
+            sb.Append($" ON CONFLICT ({keyColumnName}) DO UPDATE SET ");
+            sb.Append(string.Join(',', propertyNames.Select(p => $"{p} = EXCLUDED.{p}")));
+
+            await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
+            cmd.Parameters.AddRange(allParams.ToArray());
+
+            try
+            {
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+            catch (NpgsqlException ex)
+            {
+                if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+                {
+                    throw new InvalidProjectionSchemaException(ex);
+                }
+
+                throw new Exception(
+                    $"FlushBufferAsync failed on \"{indexDescriptor.IndexName}\" (batch of {batchSlice.Count} rows).",
+                    ex
+                );
+            }
+        }
+    }
+
     protected override async Task<ProjectionQueryResult<Dictionary<string, object?>>> QueryInternal(
         ProjectionOperationIndexDescriptor indexDescriptor,
         ProjectionQuery projectionQuery,
