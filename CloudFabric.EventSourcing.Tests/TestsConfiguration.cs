@@ -11,6 +11,7 @@ namespace CloudFabric.EventSourcing.Tests;
 /// - POSTGRES_PASSWORD: PostgreSQL password (default: cloudfabric_eventsourcing_test)
 /// - POSTGRES_DATABASE: PostgreSQL database name (default: cloudfabric_eventsourcing_test)
 /// - ELASTICSEARCH_URL: Elasticsearch URL (default: http://localhost:9222 - non-standard to avoid conflicts)
+/// - OPENSEARCH_URL: OpenSearch URL (default: http://localhost:9233 - non-standard to avoid conflicts)
 /// - COSMOSDB_CONNECTION_STRING: CosmosDB connection string (default: local emulator on port 8089)
 /// </summary>
 public static class TestsConfiguration
@@ -30,11 +31,17 @@ public static class TestsConfiguration
     public static string PostgresDatabase => 
         Environment.GetEnvironmentVariable("POSTGRES_DATABASE") ?? "cloudfabric_eventsourcing_test";
     
-    public static string PostgresConnectionString => 
-        $"Host={PostgresHost};Port={PostgresPort};Username={PostgresUser};Password={PostgresPassword};Database={PostgresDatabase};Maximum Pool Size=1000;Include Error Detail=true";
+    public static string PostgresConnectionString =>
+        PostgresConnectionStringForDatabase(PostgresDatabase);
 
-    public static string ElasticsearchUrl => 
+    public static string PostgresConnectionStringForDatabase(string database) =>
+        $"Host={PostgresHost};Port={PostgresPort};Username={PostgresUser};Password={PostgresPassword};Database={database};Maximum Pool Size=1000;Include Error Detail=true";
+
+    public static string ElasticsearchUrl =>
         Environment.GetEnvironmentVariable("ELASTICSEARCH_URL") ?? "http://localhost:9222";
+
+    public static string OpenSearchUrl =>
+        Environment.GetEnvironmentVariable("OPENSEARCH_URL") ?? "http://localhost:9233";
 
     /// <summary>
     /// CosmosDB connection string. Default is the local emulator on standard port 8081 with the well-known emulator key.

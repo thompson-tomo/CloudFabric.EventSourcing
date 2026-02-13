@@ -171,10 +171,10 @@ public class PostgresqlProjectionRepository : ProjectionRepository
     {
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync();
-        
-        var commandText = ConstructCreateTableCommandText(indexName, projectionDocumentSchema);
 
-        await using var createTableCommand = new NpgsqlCommand(commandText, conn);
+        var createTableSql = ConstructCreateTableSql(indexName, projectionDocumentSchema);
+
+        await using var createTableCommand = new NpgsqlCommand(createTableSql, conn);
         try
         {
             await createTableCommand.ExecuteNonQueryAsync();
@@ -189,8 +189,15 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         catch (Exception createTableException)
         {
             var exception = new Exception($"Failed to create a table for projection \"{TableName}\"", createTableException);
-            exception.Data.Add("commandText", commandText);
+            exception.Data.Add("commandText", createTableSql);
             throw exception;
+        }
+
+        var createIndexesSql = ConstructCreateIndexesSql(indexName, projectionDocumentSchema);
+        if (!string.IsNullOrEmpty(createIndexesSql))
+        {
+            await using var createIndexesCommand = new NpgsqlCommand(createIndexesSql, conn);
+            await createIndexesCommand.ExecuteNonQueryAsync();
         }
     }
 
@@ -606,9 +613,9 @@ public class PostgresqlProjectionRepository : ProjectionRepository
 
         if (!string.IsNullOrWhiteSpace(projectionQuery.SearchText) && projectionQuery.SearchText != "*")
         {
-            (string searchQuery, NpgsqlParameter param) = ConstructSearchQuery(projectionQuery.SearchText, indexDescriptor.ProjectionDocumentSchema);
+            var (searchQuery, searchParams) = ConstructSearchQuery(projectionQuery.SearchText, indexDescriptor.ProjectionDocumentSchema);
             queryChunk.WhereChunk += string.IsNullOrWhiteSpace(queryChunk.WhereChunk) ? $" {searchQuery}" : $" AND {searchQuery}";
-            queryChunk.Parameters.Add(param);
+            queryChunk.Parameters.AddRange(searchParams);
         }
 
         if (!string.IsNullOrEmpty(queryChunk.WhereChunk))
@@ -631,10 +638,11 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         
         if (projectionQuery.OrderBy.Count > 0)
         {
-            // NOTE: nested sorting is not implemented
-            sb.Append(" ORDER BY ");
-            sb.AppendJoin(',', projectionQuery.OrderBy.Select(kv =>
+            var orderByClauses = new List<string>();
+            for (var sortIdx = 0; sortIdx < projectionQuery.OrderBy.Count; sortIdx++)
             {
+                var kv = projectionQuery.OrderBy[sortIdx];
+
                 if (!Regex.IsMatch(kv.KeyPath, @"^[a-zA-Z_][a-zA-Z0-9_.]*$"))
                 {
                     throw new ProjectionQueryFilterException($"Invalid sort key: {kv.KeyPath}");
@@ -646,8 +654,66 @@ public class PostgresqlProjectionRepository : ProjectionRepository
                     throw new ProjectionQueryFilterException($"Invalid sort order: {kv.Order}");
                 }
 
-                return $"{kv.KeyPath} {kv.Order}";
-            }));
+                var pathParts = kv.KeyPath.Split('.');
+                if (pathParts.Length > 1)
+                {
+                    var topLevelProp = indexDescriptor.ProjectionDocumentSchema.Properties
+                        .FirstOrDefault(p => p.PropertyName == pathParts[0]);
+
+                    if (topLevelProp is { IsNestedObject: true })
+                    {
+                        var jsonPath = $"{pathParts[0]}->>{string.Join("->>", pathParts.Skip(1).Select(p => $"'{p}'"))}";
+                        orderByClauses.Add($"{jsonPath} {kv.Order} NULLS LAST");
+                        continue;
+                    }
+
+                    if (topLevelProp is { IsNestedArray: true })
+                    {
+                        if (kv.Filters.Any())
+                        {
+                            var filterConditions = new List<string>();
+                            for (var fi = 0; fi < kv.Filters.Count; fi++)
+                            {
+                                var filter = kv.Filters[fi];
+                                var filterParts = filter.FilterKeyPath.Split('.');
+                                var filterPropName = filterParts.Length > 1 ? filterParts[^1] : filterParts[0];
+
+                                var sortFilterParamName = $"sortFilter_{sortIdx}_{fi}";
+                                queryChunk.Parameters.Add(new NpgsqlParameter(sortFilterParamName, filter.FilterValue));
+
+                                var elemAccess = $"_sort_elem->>'{filterPropName}'";
+                                if (filter.FilterValue is decimal)
+                                    elemAccess = $"({elemAccess})::decimal";
+                                else if (filter.FilterValue is int)
+                                    elemAccess = $"({elemAccess})::int";
+                                else if (filter.FilterValue is long)
+                                    elemAccess = $"({elemAccess})::bigint";
+                                else if (filter.FilterValue is Guid)
+                                    elemAccess = $"({elemAccess})::uuid";
+
+                                filterConditions.Add($"{elemAccess} = @{sortFilterParamName}");
+                            }
+
+                            var sortPropName = pathParts[^1];
+                            var subquery = $"(SELECT _sort_elem->>'{sortPropName}' FROM jsonb_array_elements({pathParts[0]}) _sort_elem " +
+                                           $"WHERE {string.Join(" AND ", filterConditions)} LIMIT 1)";
+                            orderByClauses.Add($"{subquery} {kv.Order} NULLS LAST");
+                        }
+                        else
+                        {
+                            var sortPropName = pathParts[^1];
+                            orderByClauses.Add($"({pathParts[0]}->0->>'{sortPropName}') {kv.Order} NULLS LAST");
+                        }
+
+                        continue;
+                    }
+                }
+
+                orderByClauses.Add($"{kv.KeyPath} {kv.Order}");
+            }
+
+            sb.Append(" ORDER BY ");
+            sb.Append(string.Join(',', orderByClauses));
         }
         
         if (projectionQuery.Limit.HasValue)
@@ -1118,39 +1184,122 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         return queryChunk;
     }
 
-    private (string, NpgsqlParameter) ConstructSearchQuery(string searchText, ProjectionDocumentSchema schema)
+    private (string, List<NpgsqlParameter>) ConstructSearchQuery(string searchText, ProjectionDocumentSchema schema)
     {
-        // TODO: add search inside nexted jsonb columns
-        var searchableProperties = schema.Properties.Where(x => x.IsSearchable);
+        var words = searchText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var parameters = new List<NpgsqlParameter>();
 
-        List<string> query = new List<string>();
+        var fieldTemplates = new List<string>();
+        var aliasCounter = 0;
+        CollectSearchableFieldTemplates(schema.Properties, fieldTemplates, parentPath: null, isParentArray: false, ref aliasCounter);
 
-        foreach (var property in searchableProperties)
+        if (fieldTemplates.Count == 0)
         {
-            query.Add($"{property.PropertyName} ILIKE @searchText");
+            return ("TRUE", parameters);
         }
 
-        return (
-            $"({string.Join(" OR ", query)})",
-            new NpgsqlParameter("searchText", $"%{searchText}%")
-        );
+        var wordClauses = new List<string>();
+        for (var i = 0; i < words.Length; i++)
+        {
+            var paramName = $"searchWord{i}";
+            parameters.Add(new NpgsqlParameter(paramName, $"%{words[i]}%"));
+
+            var fieldMatches = fieldTemplates
+                .Select(t => t.Replace("{PARAM}", $"@{paramName}"))
+                .ToList();
+
+            wordClauses.Add($"({string.Join(" OR ", fieldMatches)})");
+        }
+
+        return ($"({string.Join(" AND ", wordClauses)})", parameters);
     }
 
-    private string ConstructCreateTableCommandText(string tableName, ProjectionDocumentSchema schema)
+    private static void CollectSearchableFieldTemplates(
+        List<ProjectionDocumentPropertySchema> properties,
+        List<string> templates,
+        string? parentPath,
+        bool isParentArray,
+        ref int aliasCounter)
     {
-        var commandText = new StringBuilder();
-        commandText.AppendFormat("CREATE TABLE \"{0}\" (", tableName);
+        foreach (var property in properties)
+        {
+            if (property.IsNestedObject && property.NestedObjectProperties != null)
+            {
+                var path = parentPath ?? property.PropertyName;
+                CollectSearchableFieldTemplates(property.NestedObjectProperties, templates, path, false, ref aliasCounter);
+            }
+            else if (property.IsNestedArray && property.NestedObjectProperties != null)
+            {
+                var path = parentPath ?? property.PropertyName;
+                CollectSearchableFieldTemplates(property.NestedObjectProperties, templates, path, true, ref aliasCounter);
+            }
+            else if (property.IsSearchable)
+            {
+                if (parentPath != null)
+                {
+                    if (isParentArray)
+                    {
+                        var alias = $"_se{aliasCounter++}";
+                        templates.Add(
+                            $"EXISTS(SELECT 1 FROM jsonb_array_elements({parentPath}) {alias} " +
+                            $"WHERE {alias}->>'{property.PropertyName}' ILIKE {{PARAM}})"
+                        );
+                    }
+                    else
+                    {
+                        templates.Add($"{parentPath}->>'{property.PropertyName}' ILIKE {{PARAM}}");
+                    }
+                }
+                else
+                {
+                    templates.Add($"{property.PropertyName} ILIKE {{PARAM}}");
+                }
+            }
+        }
+    }
+
+    private static string ConstructCreateTableSql(string tableName, ProjectionDocumentSchema schema)
+    {
+        var sb = new StringBuilder();
+        sb.AppendFormat("CREATE TABLE \"{0}\" (", tableName);
 
         var columnsSql = schema.Properties
             .Select(ConstructColumnCreateStatementForProperty);
 
-        commandText.Append(string.Join(',', columnsSql));
+        sb.Append(string.Join(',', columnsSql));
+        sb.Append(')');
 
-        commandText.AppendFormat(")");
-        
-        // TODO: add indexes for properties that have IsFilterable = true
+        return sb.ToString();
+    }
 
-        return commandText.ToString();
+    private static string ConstructCreateIndexesSql(string tableName, ProjectionDocumentSchema schema)
+    {
+        var sb = new StringBuilder();
+
+        foreach (var property in schema.Properties)
+        {
+            if (property.IsKey)
+            {
+                continue;
+            }
+
+            if (property.IsNestedObject || property.IsNestedArray)
+            {
+                sb.Append(
+                    $"CREATE INDEX IF NOT EXISTS \"ix_{tableName}_{property.PropertyName}_gin\"" +
+                    $" ON \"{tableName}\" USING GIN ({property.PropertyName});"
+                );
+            }
+            else if (property.IsFilterable)
+            {
+                sb.Append(
+                    $"CREATE INDEX IF NOT EXISTS \"ix_{tableName}_{property.PropertyName}\"" +
+                    $" ON \"{tableName}\" ({property.PropertyName});"
+                );
+            }
+        }
+
+        return sb.ToString();
     }
 
     private static string ConstructColumnCreateStatementForProperty(ProjectionDocumentPropertySchema property)

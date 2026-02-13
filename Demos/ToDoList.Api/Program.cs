@@ -61,9 +61,9 @@ builder.Services.AddPostgresqlEventStore(builder.Configuration.GetConnectionStri
     .AddPostgresqlProjections(
         builder.Configuration.GetConnectionString("Default"),
         true,
-        (factory, selector) => new UserAccountsProjectionBuilder(factory, selector),
-        (factory, selector) => new TasksProjectionBuilder(factory, selector),
-        (factory, selector) => new TaskListsProjectionBuilder(factory, selector)
+        (_, factory, selector) => new UserAccountsProjectionBuilder(factory, selector),
+        (_, factory, selector) => new TasksProjectionBuilder(factory, selector),
+        (_, factory, selector) => new TaskListsProjectionBuilder(factory, selector)
     )
     .AddProjectionsRebuildProcessor();
 

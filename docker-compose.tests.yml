@@ -12,6 +12,7 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./docker/init-test-databases.sh:/docker-entrypoint-initdb.d/init-test-databases.sh
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U cloudfabric_eventsourcing_test -d cloudfabric_eventsourcing_test"]
       interval: 5s
@@ -40,6 +41,26 @@ services:
       timeout: 10s
       retries: 10
 
+  opensearch:
+    image: opensearchproject/opensearch:2.18.0
+    container_name: cloudfabric_eventsourcing_opensearch
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - cluster.routing.allocation.disk.watermark.low=1gb
+      - cluster.routing.allocation.disk.watermark.high=500mb
+      - cluster.routing.allocation.disk.watermark.flood_stage=500mb
+    ports:
+      - "9233:9200"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
   # CosmosDB Emulator - опционально, работает медленно в Docker на Windows
   # Рекомендуется использовать нативный эмулятор: https://aka.ms/cosmosdb-emulator
   # cosmosdb:
@@ -61,4 +82,5 @@ services:
 volumes:
   postgres_data:
   elasticsearch_data:
+  opensearch_data:
   # cosmosdb_data:

@@ -228,18 +228,10 @@ public class InMemoryProjectionRepository : ProjectionRepository
 
         if (!string.IsNullOrWhiteSpace(projectionQuery.SearchText) && projectionQuery.SearchText != "*")
         {
-            var searchableProperties = indexDescriptor.ProjectionDocumentSchema.Properties
-                .Where(x => x.IsSearchable)
-                .Select(x => x.PropertyName)
-                .ToHashSet();
+            var searchWords = projectionQuery.SearchText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var schemaProperties = indexDescriptor.ProjectionDocumentSchema.Properties;
 
-            result = result.Where(x =>
-                x.Any(
-                    w => searchableProperties.Contains(w.Key)
-                        && w.Value is string s
-                        && s.Contains(projectionQuery.SearchText, StringComparison.OrdinalIgnoreCase)
-                )
-            );
+            result = result.Where(x => DocumentMatchesSearchText(x, schemaProperties, searchWords));
         }
 
         if (projectionQuery.OrderBy.Count > 0)
@@ -249,19 +241,19 @@ public class InMemoryProjectionRepository : ProjectionRepository
             foreach (var sort in projectionQuery.OrderBy)
             {
                 Func<Dictionary<string, object?>, object?> keySelector = d =>
-                    d.TryGetValue(sort.KeyPath, out var val) ? val : null;
+                    ResolveNestedSortValue(d, sort.KeyPath, sort.Filters, indexDescriptor.ProjectionDocumentSchema);
 
                 if (ordered == null)
                 {
                     ordered = string.Equals(sort.Order, "desc", StringComparison.OrdinalIgnoreCase)
-                        ? result.OrderByDescending(keySelector)
-                        : result.OrderBy(keySelector);
+                        ? result.OrderByDescending(keySelector, NullLastComparer.Instance)
+                        : result.OrderBy(keySelector, NullLastComparer.Instance);
                 }
                 else
                 {
                     ordered = string.Equals(sort.Order, "desc", StringComparison.OrdinalIgnoreCase)
-                        ? ordered.ThenByDescending(keySelector)
-                        : ordered.ThenBy(keySelector);
+                        ? ordered.ThenByDescending(keySelector, NullLastComparer.Instance)
+                        : ordered.ThenBy(keySelector, NullLastComparer.Instance);
                 }
             }
 
@@ -328,5 +320,198 @@ public class InMemoryProjectionRepository : ProjectionRepository
         }
 
         return Task.FromResult((long)materialized.Count);
+    }
+
+    private class NullLastComparer : IComparer<object?>
+    {
+        public static readonly NullLastComparer Instance = new();
+
+        public int Compare(object? x, object? y)
+        {
+            if (x == null && y == null) return 0;
+            if (x == null) return 1;
+            if (y == null) return -1;
+
+            if (x is IComparable comparable)
+            {
+                return comparable.CompareTo(y);
+            }
+
+            return string.Compare(x.ToString(), y.ToString(), StringComparison.Ordinal);
+        }
+    }
+
+    private static object? ResolveNestedSortValue(
+        Dictionary<string, object?> document,
+        string keyPath,
+        List<SortingFilter> filters,
+        ProjectionDocumentSchema schema)
+    {
+        var pathParts = keyPath.Split('.');
+
+        if (pathParts.Length == 1)
+        {
+            return document.TryGetValue(keyPath, out var val) ? val : null;
+        }
+
+        var topLevelName = pathParts[0];
+        if (!document.TryGetValue(topLevelName, out var topValue) || topValue == null)
+        {
+            return null;
+        }
+
+        var propertySchema = schema.Properties.FirstOrDefault(p => p.PropertyName == topLevelName);
+        if (propertySchema == null)
+        {
+            return null;
+        }
+
+        if (propertySchema.IsNestedObject)
+        {
+            return NavigateDictionary(topValue as Dictionary<string, object?>, pathParts.Skip(1).ToArray());
+        }
+
+        if (propertySchema.IsNestedArray)
+        {
+            if (topValue is not List<object?> list || list.Count == 0)
+            {
+                return null;
+            }
+
+            if (filters.Count > 0)
+            {
+                foreach (var item in list)
+                {
+                    if (item is not Dictionary<string, object?> itemDict)
+                    {
+                        continue;
+                    }
+
+                    var matchesAllFilters = true;
+                    foreach (var filter in filters)
+                    {
+                        var filterParts = filter.FilterKeyPath.Split('.');
+                        var filterPropName = filterParts.Length > 1 ? filterParts[^1] : filterParts[0];
+
+                        if (!itemDict.TryGetValue(filterPropName, out var filterVal)
+                            || !ValuesAreEqual(filterVal, filter.FilterValue))
+                        {
+                            matchesAllFilters = false;
+                            break;
+                        }
+                    }
+
+                    if (matchesAllFilters)
+                    {
+                        return NavigateDictionary(itemDict, pathParts.Skip(1).ToArray());
+                    }
+                }
+
+                return null;
+            }
+
+            if (list[0] is Dictionary<string, object?> firstDict)
+            {
+                return NavigateDictionary(firstDict, pathParts.Skip(1).ToArray());
+            }
+
+            return null;
+        }
+
+        return null;
+    }
+
+    private static object? NavigateDictionary(Dictionary<string, object?>? dict, string[] pathParts)
+    {
+        if (dict == null) return null;
+
+        object? current = dict;
+        foreach (var part in pathParts)
+        {
+            if (current is not Dictionary<string, object?> currentDict)
+            {
+                return null;
+            }
+
+            if (!currentDict.TryGetValue(part, out current))
+            {
+                return null;
+            }
+        }
+
+        return current;
+    }
+
+    private static bool ValuesAreEqual(object? a, object? b)
+    {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+
+        try
+        {
+            if (a.GetType() != b.GetType())
+            {
+                var converted = Convert.ChangeType(b, a.GetType());
+                return a.Equals(converted);
+            }
+
+            return a.Equals(b);
+        }
+        catch
+        {
+            return a.ToString() == b.ToString();
+        }
+    }
+
+    private static bool DocumentMatchesSearchText(
+        Dictionary<string, object?> document,
+        List<ProjectionDocumentPropertySchema> properties,
+        string[] searchWords)
+    {
+        var searchableValues = new List<string>();
+        CollectSearchableValues(document, properties, searchableValues);
+
+        return searchWords.All(word =>
+            searchableValues.Any(val => val.Contains(word, StringComparison.OrdinalIgnoreCase))
+        );
+    }
+
+    private static void CollectSearchableValues(
+        Dictionary<string, object?> document,
+        List<ProjectionDocumentPropertySchema> properties,
+        List<string> result)
+    {
+        foreach (var prop in properties)
+        {
+            if (!document.TryGetValue(prop.PropertyName, out var value) || value == null)
+            {
+                continue;
+            }
+
+            if (prop.IsNestedObject && prop.NestedObjectProperties != null)
+            {
+                if (value is Dictionary<string, object?> nestedDict)
+                {
+                    CollectSearchableValues(nestedDict, prop.NestedObjectProperties, result);
+                }
+            }
+            else if (prop.IsNestedArray && prop.NestedObjectProperties != null)
+            {
+                if (value is List<object?> list)
+                {
+                    foreach (var item in list)
+                    {
+                        if (item is Dictionary<string, object?> itemDict)
+                        {
+                            CollectSearchableValues(itemDict, prop.NestedObjectProperties, result);
+                        }
+                    }
+                }
+            }
+            else if (prop.IsSearchable && value is string s)
+            {
+                result.Add(s);
+            }
+        }
     }
 }

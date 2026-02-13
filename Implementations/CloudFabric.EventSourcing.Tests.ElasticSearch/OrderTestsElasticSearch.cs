@@ -24,7 +24,7 @@ public class OrderTestsElasticSearch : OrderTests
         if (_eventStore == null)
         {
             _eventStore = new PostgresqlEventStore(
-                TestsConfiguration.PostgresConnectionString,
+                TestsConfiguration.PostgresConnectionStringForDatabase("cloudfabric_es_test_es"),
                 "orders_events",
                 "stored_items"
             );

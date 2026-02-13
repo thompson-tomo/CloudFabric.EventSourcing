@@ -1,15 +1,15 @@
-using System.Diagnostics;
 using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.EventStore.Postgresql;
 using CloudFabric.Projections;
-using CloudFabric.Projections.Postgresql;
+using CloudFabric.Projections.OpenSearch;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
-namespace CloudFabric.EventSourcing.Tests.Postgresql;
+namespace CloudFabric.EventSourcing.Tests.OpenSearch;
 
 [TestClass]
-public class OrderTestsPostgresql : OrderTests
+public class DynamicProjectionsOrderTestsOpenSearch : DynamicProjectionSchemaTests
 {
     private ProjectionRepositoryFactory? _projectionRepositoryFactory;
     private PostgresqlEventStore? _eventStore;
@@ -20,7 +20,7 @@ public class OrderTestsPostgresql : OrderTests
         if (_eventStore == null)
         {
             _eventStore = new PostgresqlEventStore(
-                TestsConnectionStrings.CONNECTION_STRING,
+                TestsConfiguration.PostgresConnectionStringForDatabase("cloudfabric_es_test_os"),
                 "orders_events",
                 "stored_items"
             );
@@ -35,7 +35,7 @@ public class OrderTestsPostgresql : OrderTests
         if (_eventStoreEventsObserver == null)
         {
             _eventStoreEventsObserver = new PostgresqlEventStoreEventObserver(
-                _eventStore, 
+                _eventStore,
                 NullLogger<PostgresqlEventStoreEventObserver>.Instance
             );
         }
@@ -47,34 +47,17 @@ public class OrderTestsPostgresql : OrderTests
     {
         if (_projectionRepositoryFactory == null)
         {
-            _projectionRepositoryFactory = new PostgresqlProjectionRepositoryFactory(
-                NullLoggerFactory.Instance, 
-                TestsConnectionStrings.CONNECTION_STRING,
-                includeDebugInformation: true
+            _projectionRepositoryFactory = new OpenSearchProjectionRepositoryFactory(
+                new OpenSearchBasicAuthConnectionSettings(
+                TestsConfiguration.OpenSearchUrl,
+                "",
+                "",
+                ""),
+                new LoggerFactory(),
+                true
             );
         }
 
         return _projectionRepositoryFactory;
-    }
-
-    public async Task LoadTest()
-    {
-        var watch = Stopwatch.StartNew();
-
-        var tasks = new List<Task>();
-
-        for (var i = 0; i < 100; i++)
-        {
-            for (var j = 0; j < 10; j++)
-            {
-                tasks.Add(TestPlaceOrderAndAddItem());
-            }
-        }
-
-        await Task.WhenAll(tasks);
-
-        watch.Stop();
-
-        Console.WriteLine($"It took {watch.Elapsed}!");
     }
 }

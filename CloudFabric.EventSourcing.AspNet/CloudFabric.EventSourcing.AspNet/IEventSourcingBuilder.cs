@@ -9,6 +9,7 @@ namespace CloudFabric.EventSourcing.AspNet;
 /// Replaces the old reflection-based ConstructProjectionBuilder approach.
 /// </summary>
 public delegate IProjectionBuilder ProjectionBuilderFactory(
+    IServiceProvider serviceProvider,
     ProjectionRepositoryFactory repositoryFactory,
     ProjectionOperationIndexSelector indexSelector
 );

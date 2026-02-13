@@ -11,17 +11,14 @@ public class ProjectionsEngine : IProjectionsEngine
 
     private readonly EventsObserver _observer;
     private readonly ILogger<ProjectionsEngine> _logger;
-    private readonly IProjectionErrorHandler? _errorHandler;
 
     public ProjectionsEngine(
         EventsObserver eventsObserver,
-        ILogger<ProjectionsEngine> logger,
-        IProjectionErrorHandler? errorHandler = null
+        ILogger<ProjectionsEngine> logger
     )
     {
         _observer = eventsObserver ?? throw new ArgumentNullException(nameof(eventsObserver));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _errorHandler = errorHandler;
         _observer.AddEventHandler(HandleEvent);
     }
 
@@ -76,7 +73,7 @@ public class ProjectionsEngine : IProjectionsEngine
             }
             catch (Exception ex)
             {
-                await HandleProjectionError(projectionBuilder, @event, ex);
+                HandleProjectionError(projectionBuilder, @event, ex);
             }
         }
 
@@ -112,7 +109,7 @@ public class ProjectionsEngine : IProjectionsEngine
                 }
                 catch (Exception ex)
                 {
-                    await HandleProjectionError(projectionBuilder, aggregateUpdatedEvent, ex);
+                    HandleProjectionError(projectionBuilder, aggregateUpdatedEvent, ex);
                 }
             }
         }
@@ -137,22 +134,16 @@ public class ProjectionsEngine : IProjectionsEngine
             }
             catch (Exception ex)
             {
-                await HandleProjectionError(projectionBuilder, @event, ex);
+                HandleProjectionError(projectionBuilder, @event, ex);
             }
         }
     }
 
-    private async Task HandleProjectionError(IProjectionBuilder projectionBuilder, IEvent @event, Exception ex)
+    private void HandleProjectionError(IProjectionBuilder projectionBuilder, IEvent @event, Exception ex)
     {
         _logger.LogError(ex, "Projection builder {BuilderType} failed to handle event {EventType} for aggregate {AggregateId}",
             projectionBuilder.GetType().Name, @event.GetType().Name, @event.AggregateId);
 
-        if (_errorHandler != null)
-        {
-            await _errorHandler.OnError(projectionBuilder, @event, ex);
-        }
-
-        // Rethrow to surface errors during testing
         throw new InvalidOperationException($"Projection builder error: {ex.Message}", ex);
     }
 

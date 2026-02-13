@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>CloudFabric.EventSourcing.AspNet.OpenSearch</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>CloudFabric Developers</Authors>
+    <Company>CloudFabric</Company>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Implementations\CloudFabric.Projections.OpenSearch\CloudFabric.Projections.OpenSearch.csproj" />
+    <ProjectReference Include="..\CloudFabric.EventSourcing.AspNet\CloudFabric.EventSourcing.AspNet.csproj" />
+  </ItemGroup>
+
+</Project>

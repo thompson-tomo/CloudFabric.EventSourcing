@@ -4,7 +4,6 @@ using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.EventStore.InMemory;
 using CloudFabric.EventSourcing.EventStore.Persistence;
 using CloudFabric.EventSourcing.Tests.Domain;
-using CloudFabric.EventSourcing.Tests.Domain.Events;
 using CloudFabric.EventSourcing.Tests.Domain.Projections.OrdersListProjection;
 using CloudFabric.EventSourcing.Tests.Domain.ValueObjects;
 using CloudFabric.Projections;
@@ -244,73 +243,6 @@ public class ProjectionsInfrastructureTests
 
     #endregion
 
-    #region IProjectionErrorHandler
-
-    [TestMethod]
-    public async Task ErrorHandler_CalledWhenProjectionBuilderThrows()
-    {
-        var store = CreateEventStore();
-        var observer = CreateObserver(store);
-        var factory = CreateProjectionRepositoryFactory();
-
-        var errors = new ConcurrentBag<(IProjectionBuilder builder, IEvent @event, Exception ex)>();
-        var errorHandler = new LogAndContinueProjectionErrorHandler((b, e, ex) =>
-        {
-            errors.Add((b, e, ex));
-        });
-
-        var engine = new ProjectionsEngine(observer, NullLogger<ProjectionsEngine>.Instance, errorHandler);
-        engine.AddProjectionBuilder(new ThrowingProjectionBuilder(factory));
-        await engine.StartAsync("error-test");
-
-        var order = await CreateAndSaveOrder(store);
-        await Task.Delay(500);
-
-        errors.Should().NotBeEmpty("error handler should have been called");
-        errors.First().ex.Message.Should().Contain("Intentional test error");
-
-        await engine.StopAsync();
-    }
-
-    [TestMethod]
-    public async Task ErrorHandler_EngineContinuesProcessingOtherBuilders()
-    {
-        var store = CreateEventStore();
-        var observer = CreateObserver(store);
-        var factory = CreateProjectionRepositoryFactory();
-
-        var errors = new ConcurrentBag<(IProjectionBuilder builder, IEvent @event, Exception ex)>();
-        var errorHandler = new LogAndContinueProjectionErrorHandler((b, e, ex) =>
-        {
-            errors.Add((b, e, ex));
-        });
-
-        var engine = new ProjectionsEngine(observer, NullLogger<ProjectionsEngine>.Instance, errorHandler);
-
-        // Add a throwing builder first
-        engine.AddProjectionBuilder(new ThrowingProjectionBuilder(factory));
-        // Add a working builder second
-        engine.AddProjectionBuilder(CreateProjectionBuilder(factory));
-
-        await engine.StartAsync("continue-test");
-        await EnsureProjectionIndexReady(factory, observer);
-
-        var order = await CreateAndSaveOrder(store);
-        await Task.Delay(500);
-
-        // The throwing builder should have errored
-        errors.Should().NotBeEmpty();
-
-        // But the working builder should still have processed the event
-        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
-        var proj = await repo.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
-        proj.Should().NotBeNull("working builder should process event even if previous builder threw");
-
-        await engine.StopAsync();
-    }
-
-    #endregion
-
     #region ProjectionsEngineBuilder
 
     [TestMethod]
@@ -344,35 +276,6 @@ public class ProjectionsInfrastructureTests
         var proj = await repo.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
         proj.Should().NotBeNull();
         proj!.Name.Should().Be("Test Order");
-
-        await engine.StopAsync();
-    }
-
-    [TestMethod]
-    public async Task Builder_WithErrorHandler_IntegratesCorrectly()
-    {
-        var store = CreateEventStore();
-        var observer = CreateObserver(store);
-        var factory = CreateProjectionRepositoryFactory();
-
-        var errorsCaught = 0;
-        var errorHandler = new LogAndContinueProjectionErrorHandler((_, _, _) =>
-        {
-            Interlocked.Increment(ref errorsCaught);
-        });
-
-        var engine = ProjectionsEngine.CreateBuilder()
-            .WithEventsObserver(observer)
-            .AddProjectionBuilder(new ThrowingProjectionBuilder(factory))
-            .WithErrorHandler(errorHandler)
-            .Build();
-
-        await engine.StartAsync("builder-error-test");
-
-        await CreateAndSaveOrder(store);
-        await Task.Delay(500);
-
-        errorsCaught.Should().BeGreaterThan(0, "error handler should be called through builder-created engine");
 
         await engine.StopAsync();
     }
@@ -578,29 +481,4 @@ public class ProjectionsInfrastructureTests
     }
 
     #endregion
-}
-
-/// <summary>
-/// A projection builder that throws on every event, used to test error handling.
-/// </summary>
-public class ThrowingProjectionBuilder : ProjectionBuilder<OrderListProjectionItem>,
-    IHandleEvent<OrderPlaced>,
-    IHandleEvent<OrderItemAdded>
-{
-    public ThrowingProjectionBuilder(
-        ProjectionRepositoryFactory projectionRepositoryFactory,
-        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
-    ) : base(projectionRepositoryFactory, indexSelector)
-    {
-    }
-
-    public Task On(OrderPlaced evt)
-    {
-        throw new InvalidOperationException("Intentional test error in ThrowingProjectionBuilder");
-    }
-
-    public Task On(OrderItemAdded evt)
-    {
-        throw new InvalidOperationException("Intentional test error in ThrowingProjectionBuilder");
-    }
 }

@@ -47,21 +47,4 @@ public class OrderTestsInMemory : OrderTests
         return _projectionRepositoryFactory;
     }
 
-    [Ignore]
-    public override async Task TestProjectionsNestedObjectsFilter()
-    {
-        return;
-    }
-
-    [Ignore]
-    public override async Task TestProjectionsNestedObjectsQuery()
-    {
-        return;
-    }
-    
-    [Ignore]
-    public override async Task TestProjectionsNestedObjectsSorting()
-    {
-        return;
-    }
 }

@@ -293,7 +293,6 @@ var projectionsEngine = new ProjectionsEngineBuilder()
     .WithEventsObserver(eventsObserver)
     .AddProjectionBuilder(new OrdersListProjectionBuilder(projectionRepositoryFactory))
     .WithLogger(logger)               // optional
-    .WithErrorHandler(errorHandler)    // optional
     .Build();
 
 // 4. Ensure projection indices exist

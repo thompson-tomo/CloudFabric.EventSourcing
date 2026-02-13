@@ -7,7 +7,6 @@ public class ProjectionsEngineBuilder
 {
     private EventsObserver? _eventsObserver;
     private ILogger<ProjectionsEngine>? _logger;
-    private IProjectionErrorHandler? _errorHandler;
     private readonly List<IProjectionBuilder> _projectionBuilders = new();
 
     public ProjectionsEngineBuilder WithEventsObserver(EventsObserver eventsObserver)
@@ -28,12 +27,6 @@ public class ProjectionsEngineBuilder
         return this;
     }
 
-    public ProjectionsEngineBuilder WithErrorHandler(IProjectionErrorHandler errorHandler)
-    {
-        _errorHandler = errorHandler;
-        return this;
-    }
-
     public ProjectionsEngine Build()
     {
         if (_eventsObserver == null)
@@ -45,8 +38,7 @@ public class ProjectionsEngineBuilder
 
         var engine = new ProjectionsEngine(
             _eventsObserver,
-            _logger ?? NullLogger<ProjectionsEngine>.Instance,
-            _errorHandler
+            _logger ?? NullLogger<ProjectionsEngine>.Instance
         );
 
         foreach (var builder in _projectionBuilders)

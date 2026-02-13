@@ -2,14 +2,18 @@ using System.Diagnostics;
 using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.EventStore.Postgresql;
 using CloudFabric.Projections;
-using CloudFabric.Projections.Postgresql;
+using CloudFabric.Projections.OpenSearch;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
-namespace CloudFabric.EventSourcing.Tests.Postgresql;
+namespace CloudFabric.EventSourcing.Tests.OpenSearch;
 
+/// <summary>
+/// OpenSearch projections test with Postgresql event store
+/// </summary>
 [TestClass]
-public class OrderTestsPostgresql : OrderTests
+public class OrderTestsOpenSearch : OrderTests
 {
     private ProjectionRepositoryFactory? _projectionRepositoryFactory;
     private PostgresqlEventStore? _eventStore;
@@ -20,7 +24,7 @@ public class OrderTestsPostgresql : OrderTests
         if (_eventStore == null)
         {
             _eventStore = new PostgresqlEventStore(
-                TestsConnectionStrings.CONNECTION_STRING,
+                TestsConfiguration.PostgresConnectionStringForDatabase("cloudfabric_es_test_os"),
                 "orders_events",
                 "stored_items"
             );
@@ -30,31 +34,35 @@ public class OrderTestsPostgresql : OrderTests
         return _eventStore;
     }
 
+    protected override ProjectionRepositoryFactory GetProjectionRepositoryFactory()
+    {
+        if (_projectionRepositoryFactory == null)
+        {
+            _projectionRepositoryFactory = new OpenSearchProjectionRepositoryFactory(
+                new OpenSearchBasicAuthConnectionSettings(
+                TestsConfiguration.OpenSearchUrl,
+                "",
+                "",
+                ""),
+                new LoggerFactory(),
+                true
+            );
+        }
+
+        return _projectionRepositoryFactory;
+    }
+
     protected override EventsObserver GetEventStoreEventsObserver()
     {
         if (_eventStoreEventsObserver == null)
         {
             _eventStoreEventsObserver = new PostgresqlEventStoreEventObserver(
-                _eventStore, 
+                _eventStore,
                 NullLogger<PostgresqlEventStoreEventObserver>.Instance
             );
         }
 
         return _eventStoreEventsObserver;
-    }
-
-    protected override ProjectionRepositoryFactory GetProjectionRepositoryFactory()
-    {
-        if (_projectionRepositoryFactory == null)
-        {
-            _projectionRepositoryFactory = new PostgresqlProjectionRepositoryFactory(
-                NullLoggerFactory.Instance, 
-                TestsConnectionStrings.CONNECTION_STRING,
-                includeDebugInformation: true
-            );
-        }
-
-        return _projectionRepositoryFactory;
     }
 
     public async Task LoadTest()

@@ -77,6 +77,7 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
                         foreach (var factory in builder.ProjectionBuilderFactories)
                         {
                             var projectionBuilder = factory(
+                                sp,
                                 projectionsRepositoryFactory,
                                 ProjectionOperationIndexSelector.Write
                             );
@@ -227,6 +228,7 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
                                 foreach (var factory in b.ProjectionBuilderFactories)
                                 {
                                     var projectionBuilder = factory(
+                                        rebuildProcessorScope.ServiceProvider,
                                         rebuildProcessorScope.ServiceProvider.GetRequiredKeyedService<ProjectionRepositoryFactory>(builder.EventStoreKey),
                                         ProjectionOperationIndexSelector.ProjectionRebuild
                                     );

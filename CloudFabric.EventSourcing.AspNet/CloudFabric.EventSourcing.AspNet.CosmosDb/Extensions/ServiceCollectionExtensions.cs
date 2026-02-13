@@ -34,6 +34,9 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
             var metadataRepository = new CosmosDbMetadataRepository(connectionString, cosmosClientOptions, databaseId, itemsContainerId);
             services.AddScoped<IMetadataRepository>(_ => metadataRepository);
 
+            var sequenceGenerator = new CosmosDbSequenceGenerator(cosmosClient, databaseId, itemsContainerId);
+            services.AddScoped<ISequenceGenerator>(_ => sequenceGenerator);
+
             // Register change feed observer as singleton (background process)
             services.AddSingleton<CosmosDbEventStoreChangeFeedObserver>(sp =>
             {
@@ -117,6 +120,7 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
                 foreach (var factory in projectionBuilderFactories)
                 {
                     var projectionBuilder = factory(
+                        sp,
                         projectionsRepositoryFactory,
                         ProjectionOperationIndexSelector.Write
                     );

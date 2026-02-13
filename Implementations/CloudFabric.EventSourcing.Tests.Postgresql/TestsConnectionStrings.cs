@@ -4,5 +4,5 @@ namespace CloudFabric.EventSourcing.Tests.Postgresql;
 
 public static class TestsConnectionStrings
 {
-    public static readonly string CONNECTION_STRING = TestsConfiguration.PostgresConnectionString;
+    public static readonly string CONNECTION_STRING = TestsConfiguration.PostgresConnectionStringForDatabase("cloudfabric_es_test_pg");
 }

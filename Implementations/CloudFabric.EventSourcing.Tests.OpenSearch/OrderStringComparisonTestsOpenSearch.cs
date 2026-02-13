@@ -1,18 +1,18 @@
 using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.EventStore.Postgresql;
 using CloudFabric.Projections;
-using CloudFabric.Projections.ElasticSearch;
+using CloudFabric.Projections.OpenSearch;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
-namespace CloudFabric.EventSourcing.Tests.ElasticSearch;
+namespace CloudFabric.EventSourcing.Tests.OpenSearch;
 
 /// <summary>
-/// Elastic Search projections test with Postgresql event store
+/// OpenSearch projections test with Postgresql event store
 /// </summary>
 [TestClass]
-public class OrderStringComparisonTestsElasticSearch : OrderStringComparisonTests
+public class OrderStringComparisonTestsOpenSearch : OrderStringComparisonTests
 {
     private ProjectionRepositoryFactory? _projectionRepositoryFactory;
     private PostgresqlEventStore? _eventStore;
@@ -23,7 +23,7 @@ public class OrderStringComparisonTestsElasticSearch : OrderStringComparisonTest
         if (_eventStore == null)
         {
             _eventStore = new PostgresqlEventStore(
-                TestsConfiguration.PostgresConnectionStringForDatabase("cloudfabric_es_test_es"),
+                TestsConfiguration.PostgresConnectionStringForDatabase("cloudfabric_es_test_os"),
                 "orders_events",
                 "orders_items"
             );
@@ -37,9 +37,9 @@ public class OrderStringComparisonTestsElasticSearch : OrderStringComparisonTest
     {
         if (_projectionRepositoryFactory == null)
         {
-            _projectionRepositoryFactory = new ElasticSearchProjectionRepositoryFactory(
-                new ElasticSearchBasicAuthConnectionSettings(
-                TestsConfiguration.ElasticsearchUrl,
+            _projectionRepositoryFactory = new OpenSearchProjectionRepositoryFactory(
+                new OpenSearchBasicAuthConnectionSettings(
+                TestsConfiguration.OpenSearchUrl,
                 "",
                 "",
                 ""),
@@ -56,7 +56,7 @@ public class OrderStringComparisonTestsElasticSearch : OrderStringComparisonTest
         if (_eventStoreEventsObserver == null)
         {
             _eventStoreEventsObserver = new PostgresqlEventStoreEventObserver(
-                _eventStore, 
+                _eventStore,
                 NullLogger<PostgresqlEventStoreEventObserver>.Instance
             );
         }
