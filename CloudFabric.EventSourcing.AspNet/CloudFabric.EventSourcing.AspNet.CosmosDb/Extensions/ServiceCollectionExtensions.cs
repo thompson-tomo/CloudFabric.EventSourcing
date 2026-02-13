@@ -115,7 +115,12 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
             builder.Services.AddSingleton<ProjectionsEngine>(sp =>
             {
                 var changeFeedObserver = sp.GetRequiredService<CosmosDbEventStoreChangeFeedObserver>();
-                var projectionsEngine = new ProjectionsEngine(changeFeedObserver);
+                var errorHandler = sp.GetService<IProjectionErrorHandler>();
+                var projectionsEngine = new ProjectionsEngine(
+                    changeFeedObserver,
+                    sp.GetRequiredService<ILogger<ProjectionsEngine>>(),
+                    errorHandler
+                );
 
                 foreach (var factory in projectionBuilderFactories)
                 {

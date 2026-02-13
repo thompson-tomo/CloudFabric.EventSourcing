@@ -87,6 +87,12 @@ public interface IProjectionRepository
     /// Returns true if the repository is currently in batch mode.
     /// </summary>
     bool IsBatchMode { get; }
+
+    /// <summary>
+    /// Controls auto-flush behavior for batch mode. When <see cref="BatchBufferOptions.MaxBufferSize"/> is reached,
+    /// the buffer is automatically flushed. Set MaxBufferSize to 0 to disable auto-flush.
+    /// </summary>
+    BatchBufferOptions BatchBufferOptions { get; set; }
 }
 
 public interface IProjectionRepository<TDocument> : IProjectionRepository

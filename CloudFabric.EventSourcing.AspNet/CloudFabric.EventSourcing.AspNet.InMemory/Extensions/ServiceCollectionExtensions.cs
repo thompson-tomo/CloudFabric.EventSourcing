@@ -36,7 +36,12 @@ namespace CloudFabric.EventSourcing.AspNet.InMemory.Extensions
 
                     if (projectionsRepositoryFactory != null && builder.ProjectionBuilderFactories != null)
                     {
-                        var projectionsEngine = new ProjectionsEngine(eventStoreObserver);
+                        var errorHandler = sp.GetService<IProjectionErrorHandler>();
+                        var projectionsEngine = new ProjectionsEngine(
+                            eventStoreObserver,
+                            sp.GetRequiredService<ILogger<ProjectionsEngine>>(),
+                            errorHandler
+                        );
 
                         foreach (var factory in builder.ProjectionBuilderFactories)
                         {

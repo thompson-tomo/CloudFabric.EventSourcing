@@ -1,3 +1,4 @@
+using CloudFabric.Projections.Resilience;
 using Microsoft.Extensions.Logging;
 
 namespace CloudFabric.Projections.ElasticSearch;
@@ -8,9 +9,10 @@ public class ElasticSearchProjectionRepositoryFactory : ProjectionRepositoryFact
     private readonly ElasticSearchBasicAuthConnectionSettings? _basicAuthConnectionSettings;
     private readonly ElasticSearchApiKeyAuthConnectionSettings? _apiKeyAuthConnectionSettings;
     private readonly bool _disableRequestStreaming;
+    private readonly ResilienceSettings? _resilienceSettings;
 
     /// <summary>
-    /// 
+    ///
     /// </summary>
     /// <param name="connectionSettings"></param>
     /// <param name="loggerFactory"></param>
@@ -20,19 +22,24 @@ public class ElasticSearchProjectionRepositoryFactory : ProjectionRepositoryFact
     ///
     /// Defaults to false to improve performance.
     /// </param>
+    /// <param name="resilienceSettings">
+    /// Optional retry/circuit-breaker settings forwarded to each repository instance.
+    /// </param>
     public ElasticSearchProjectionRepositoryFactory(
         ElasticSearchBasicAuthConnectionSettings connectionSettings,
         ILoggerFactory loggerFactory,
-        bool disableRequestStreaming = false
+        bool disableRequestStreaming = false,
+        ResilienceSettings? resilienceSettings = null
     ): base(loggerFactory)
     {
         _basicAuthConnectionSettings = connectionSettings;
         _loggerFactory = loggerFactory;
         _disableRequestStreaming = disableRequestStreaming;
+        _resilienceSettings = resilienceSettings;
     }
 
     /// <summary>
-    /// 
+    ///
     /// </summary>
     /// <param name="apiKeyAuthConnectionSettings"></param>
     /// <param name="loggerFactory"></param>
@@ -42,15 +49,20 @@ public class ElasticSearchProjectionRepositoryFactory : ProjectionRepositoryFact
     ///
     /// Defaults to false to improve performance.
     /// </param>
+    /// <param name="resilienceSettings">
+    /// Optional retry/circuit-breaker settings forwarded to each repository instance.
+    /// </param>
     public ElasticSearchProjectionRepositoryFactory(
-        ElasticSearchApiKeyAuthConnectionSettings apiKeyAuthConnectionSettings, 
+        ElasticSearchApiKeyAuthConnectionSettings apiKeyAuthConnectionSettings,
         ILoggerFactory loggerFactory,
-        bool disableRequestStreaming = false
+        bool disableRequestStreaming = false,
+        ResilienceSettings? resilienceSettings = null
     ): base(loggerFactory)
     {
         _loggerFactory = loggerFactory;
         _apiKeyAuthConnectionSettings = apiKeyAuthConnectionSettings;
         _disableRequestStreaming = disableRequestStreaming;
+        _resilienceSettings = resilienceSettings;
     }
 
     public override IProjectionRepository<TProjectionDocument> GetProjectionRepository<TProjectionDocument>()
@@ -67,13 +79,15 @@ public class ElasticSearchProjectionRepositoryFactory : ProjectionRepositoryFact
             repository = new ElasticSearchProjectionRepository<TProjectionDocument>(
                 _basicAuthConnectionSettings,
                 _loggerFactory,
-                _disableRequestStreaming
+                _disableRequestStreaming,
+                _resilienceSettings
             );
         }
         else if (_apiKeyAuthConnectionSettings != null)
         {
             repository = new ElasticSearchProjectionRepository<TProjectionDocument>(
-                _apiKeyAuthConnectionSettings, _loggerFactory, _disableRequestStreaming
+                _apiKeyAuthConnectionSettings, _loggerFactory, _disableRequestStreaming,
+                _resilienceSettings
             );
         }
 
@@ -93,7 +107,7 @@ public class ElasticSearchProjectionRepositoryFactory : ProjectionRepositoryFact
         {
             return cached;
         }
-        
+
         ProjectionRepository? repository = null;
         if (_basicAuthConnectionSettings != null)
         {
@@ -101,7 +115,8 @@ public class ElasticSearchProjectionRepositoryFactory : ProjectionRepositoryFact
                 _basicAuthConnectionSettings,
                 projectionDocumentSchema,
                 _loggerFactory,
-                _disableRequestStreaming
+                _disableRequestStreaming,
+                _resilienceSettings
             );
         }
         else if (_apiKeyAuthConnectionSettings != null)
@@ -110,7 +125,8 @@ public class ElasticSearchProjectionRepositoryFactory : ProjectionRepositoryFact
                 _apiKeyAuthConnectionSettings,
                 projectionDocumentSchema,
                 _loggerFactory,
-                _disableRequestStreaming
+                _disableRequestStreaming,
+                _resilienceSettings
             );
         }
 

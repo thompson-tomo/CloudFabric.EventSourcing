@@ -56,6 +56,12 @@ public abstract class ProjectionRepository : IProjectionRepository
     private ProjectionOperationIndexDescriptor? _batchIndexDescriptor;
     private ProjectionOperationIndexSelector _batchIndexSelector = ProjectionOperationIndexSelector.Write;
 
+    /// <summary>
+    /// Controls auto-flush behavior for batch mode. When <see cref="BatchBufferOptions.MaxBufferSize"/> is reached,
+    /// the buffer is automatically flushed. Set MaxBufferSize to 0 to disable auto-flush.
+    /// </summary>
+    public BatchBufferOptions BatchBufferOptions { get; set; } = new();
+
     protected record BufferedUpsert(
         string Id, Dictionary<string, object?> Document,
         string PartitionKey, DateTime UpdatedAt);
@@ -99,9 +105,10 @@ public abstract class ProjectionRepository : IProjectionRepository
     }
 
     /// <summary>
-    /// Atomically copies the buffer, clears it, then writes all buffered operations
-    /// to the backing store via <see cref="FlushBufferAsync"/>. Deletes are applied first.
+    /// Copies the buffer, writes all buffered operations to the backing store, then removes
+    /// only the successfully written items. Deletes are applied first.
     /// No-op when not in batch mode or buffer is empty.
+    /// If the write fails, items remain in the buffer and will be retried on the next flush.
     /// </summary>
     public async Task FlushBatchAsync(CancellationToken cancellationToken = default)
     {
@@ -113,8 +120,7 @@ public abstract class ProjectionRepository : IProjectionRepository
             if (_upsertBuffer.Count == 0 && _deleteBuffer.Count == 0) return;
             items = new List<BufferedUpsert>(_upsertBuffer);
             deletes = _deleteBuffer.ToList();
-            _upsertBuffer.Clear();
-            _deleteBuffer.Clear();
+            // Do NOT clear yet — wait for write to succeed
         }
 
         _batchIndexDescriptor ??= await GetIndexDescriptorForOperation(
@@ -129,6 +135,21 @@ public abstract class ProjectionRepository : IProjectionRepository
         if (items.Count > 0)
         {
             await FlushBufferAsync(_batchIndexDescriptor, items, cancellationToken);
+        }
+
+        // Only clear after successful write — remove only the items we wrote.
+        // New items may have been added to the buffer while we were writing.
+        lock (_batchLock)
+        {
+            foreach (var item in items)
+            {
+                _upsertBuffer.RemoveAll(x => x.Id == item.Id && x.PartitionKey == item.PartitionKey);
+            }
+
+            foreach (var (id, pk) in deletes)
+            {
+                _deleteBuffer.Remove((id, pk));
+            }
         }
     }
 
@@ -257,6 +278,8 @@ public abstract class ProjectionRepository : IProjectionRepository
     {
         if (_isBatchMode)
         {
+            bool shouldAutoFlush = false;
+
             lock (_batchLock)
             {
                 var keyValue = document[ProjectionDocumentSchema.KeyColumnName]?.ToString()
@@ -266,7 +289,19 @@ public abstract class ProjectionRepository : IProjectionRepository
                 // Replace existing buffered entry (last write wins)
                 _upsertBuffer.RemoveAll(x => x.Id == keyValue && x.PartitionKey == partitionKey);
                 _upsertBuffer.Add(new BufferedUpsert(keyValue, new Dictionary<string, object?>(document), partitionKey, updatedAt));
+
+                if (BatchBufferOptions.MaxBufferSize > 0
+                    && _upsertBuffer.Count + _deleteBuffer.Count >= BatchBufferOptions.MaxBufferSize)
+                {
+                    shouldAutoFlush = true;
+                }
             }
+
+            if (shouldAutoFlush)
+            {
+                await FlushBatchAsync(cancellationToken);
+            }
+
             return;
         }
 
@@ -291,12 +326,26 @@ public abstract class ProjectionRepository : IProjectionRepository
     {
         if (_isBatchMode)
         {
+            var shouldAutoFlush = false;
+
             lock (_batchLock)
             {
                 var idStr = id.ToString();
                 _upsertBuffer.RemoveAll(x => x.Id == idStr && x.PartitionKey == partitionKey);
                 _deleteBuffer.Add((idStr, partitionKey));
+
+                if (BatchBufferOptions.MaxBufferSize > 0
+                    && _upsertBuffer.Count + _deleteBuffer.Count >= BatchBufferOptions.MaxBufferSize)
+                {
+                    shouldAutoFlush = true;
+                }
             }
+
+            if (shouldAutoFlush)
+            {
+                await FlushBatchAsync(cancellationToken);
+            }
+
             return;
         }
 
@@ -666,11 +715,13 @@ public abstract class ProjectionRepository : IProjectionRepository
         return droppedCount;
     }
 
-    public async Task<(ProjectionIndexState?, string?)> AcquireAndLockProjectionThatRequiresRebuild()
+    public async Task<(ProjectionIndexState?, string?)> AcquireAndLockProjectionThatRequiresRebuild(
+        TimeSpan? healthCheckTimeout = null)
     {
         // we need to round datetime received from the database because postgresql has less precision than dotnet
         // https://stackoverflow.com/questions/51103606/storing-datetime-in-postgresql-without-loosing-precision
-        var rebuildHealthCheckThreshold = DateTime.UtcNow.AddMinutes(-5).RoundToMicroseconds();
+        var timeout = healthCheckTimeout ?? TimeSpan.FromMinutes(5);
+        var rebuildHealthCheckThreshold = DateTime.UtcNow.Add(-timeout).RoundToMicroseconds();
         
         // we are looking for two possible index states:
         // 1. RebuildStartedAt = null - index was just created and requires rebuild and

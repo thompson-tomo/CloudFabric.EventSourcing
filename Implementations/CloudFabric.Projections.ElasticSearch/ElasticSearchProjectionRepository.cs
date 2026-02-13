@@ -1,11 +1,14 @@
 using System.Collections;
+using System.Net.Http;
 using System.Text.Json;
 using CloudFabric.Projections.ElasticSearch.Helpers;
 using CloudFabric.Projections.Queries;
+using CloudFabric.Projections.Resilience;
 using CloudFabric.Projections.Utils;
 using Elasticsearch.Net;
 using Microsoft.Extensions.Logging;
 using Nest;
+using Polly;
 using SortOrder = Nest.SortOrder;
 
 namespace CloudFabric.Projections.ElasticSearch;
@@ -16,12 +19,14 @@ public class ElasticSearchProjectionRepository<TProjectionDocument> : ElasticSea
     public ElasticSearchProjectionRepository(
         ElasticSearchBasicAuthConnectionSettings basicAuthConnectionSettings,
         ILoggerFactory loggerFactory,
-        bool disableRequestStreaming
+        bool disableRequestStreaming,
+        ResilienceSettings? resilienceSettings = null
     ) : base(
         basicAuthConnectionSettings,
         ProjectionDocumentSchemaFactory.FromTypeWithAttributes<TProjectionDocument>(),
         loggerFactory,
-        disableRequestStreaming
+        disableRequestStreaming,
+        resilienceSettings
     )
     {
     }
@@ -29,12 +34,14 @@ public class ElasticSearchProjectionRepository<TProjectionDocument> : ElasticSea
     public ElasticSearchProjectionRepository(
         ElasticSearchApiKeyAuthConnectionSettings apiKeyAuthConnectionSettings,
         ILoggerFactory loggerFactory,
-        bool disableRequestStreaming
+        bool disableRequestStreaming,
+        ResilienceSettings? resilienceSettings = null
     ) : base(
         apiKeyAuthConnectionSettings,
         ProjectionDocumentSchemaFactory.FromTypeWithAttributes<TProjectionDocument>(),
         loggerFactory,
-        disableRequestStreaming
+        disableRequestStreaming,
+        resilienceSettings
     )
     {
     }
@@ -110,6 +117,7 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
     private readonly ElasticSearchIndexer _indexer;
     private readonly ILogger<ElasticSearchProjectionRepository> _logger;
     private readonly Task _clusterSettingsTask;
+    private readonly ResiliencePipeline _retryPipeline;
 
     /// <summary>
     /// When request streaming is disabled, elastic adds debug information about request and response to response object which can
@@ -118,7 +126,7 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
     private readonly bool _disableRequestStreaming;
 
     /// <summary>
-    /// 
+    ///
     /// </summary>
     /// <param name="apiKeyAuthConnectionSettings"></param>
     /// <param name="projectionDocumentSchema"></param>
@@ -129,11 +137,15 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
     ///
     /// Defaults to false to improve performance.
     /// </param>
+    /// <param name="resilienceSettings">
+    /// Optional retry/circuit-breaker settings. When null, <see cref="ResilienceSettings.Default"/> is used.
+    /// </param>
     public ElasticSearchProjectionRepository(
         ElasticSearchApiKeyAuthConnectionSettings apiKeyAuthConnectionSettings,
         ProjectionDocumentSchema projectionDocumentSchema,
         ILoggerFactory loggerFactory,
-        bool disableRequestStreaming = false
+        bool disableRequestStreaming = false,
+        ResilienceSettings? resilienceSettings = null
     ) : base(projectionDocumentSchema, loggerFactory.CreateLogger<ProjectionRepository>())
     {
         _projectionDocumentSchema = projectionDocumentSchema;
@@ -160,10 +172,11 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         }));
 
         _indexer = new ElasticSearchIndexer(apiKeyAuthConnectionSettings, loggerFactory);
+        _retryPipeline = BuildResiliencePipeline(resilienceSettings ?? ResilienceSettings.Default, _logger);
     }
 
     /// <summary>
-    /// 
+    ///
     /// </summary>
     /// <param name="basicAuthConnectionSettings"></param>
     /// <param name="projectionDocumentSchema"></param>
@@ -174,11 +187,15 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
     ///
     /// Defaults to false to improve performance.
     /// </param>
+    /// <param name="resilienceSettings">
+    /// Optional retry/circuit-breaker settings. When null, <see cref="ResilienceSettings.Default"/> is used.
+    /// </param>
     public ElasticSearchProjectionRepository(
         ElasticSearchBasicAuthConnectionSettings basicAuthConnectionSettings,
         ProjectionDocumentSchema projectionDocumentSchema,
         ILoggerFactory loggerFactory,
-        bool disableRequestStreaming = false
+        bool disableRequestStreaming = false,
+        ResilienceSettings? resilienceSettings = null
     ) : base(projectionDocumentSchema, loggerFactory.CreateLogger<ProjectionRepository>())
     {
         _projectionDocumentSchema = projectionDocumentSchema;
@@ -203,6 +220,7 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         }));
 
         _indexer = new ElasticSearchIndexer(basicAuthConnectionSettings, loggerFactory);
+        _retryPipeline = BuildResiliencePipeline(resilienceSettings ?? ResilienceSettings.Default, _logger);
     }
 
     public string? KeyColumnName
@@ -217,16 +235,47 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
             return _keyPropertyName;
         }
     }
-  
+
+    private static readonly int[] TransientHttpStatusCodes = { 429, 502, 503, 504 };
+
+    private static ResiliencePipeline BuildResiliencePipeline(ResilienceSettings settings, ILogger logger)
+    {
+        var shouldHandle = new PredicateBuilder<object>()
+            .Handle<ElasticsearchClientException>(ex =>
+                ex.Response?.HttpStatusCode != null &&
+                TransientHttpStatusCodes.Contains(ex.Response.HttpStatusCode.Value)
+            )
+            .Handle<HttpRequestException>()
+            .Handle<TaskCanceledException>();
+
+        return ResiliencePipelineFactory.Create(settings, shouldHandle, logger, "ElasticSearch");
+    }
+
+    private async Task<T> ExecuteWithRetriesAsync<T>(Func<CancellationToken, Task<T>> operation, CancellationToken ct)
+    {
+        return await _retryPipeline.ExecuteAsync(async (token) => await operation(token), ct);
+    }
+
+    private async Task ExecuteWithRetriesAsync(Func<CancellationToken, Task> operation, CancellationToken ct)
+    {
+        await _retryPipeline.ExecuteAsync(async (token) => { await operation(token); return 0; }, ct);
+    }
+
     protected override async Task CreateIndex(string indexName, ProjectionDocumentSchema projectionDocumentSchema)
     {
         await _clusterSettingsTask;
-        await _indexer.CreateOrUpdateIndex(indexName, projectionDocumentSchema);
+        await ExecuteWithRetriesAsync(async (_) =>
+        {
+            await _indexer.CreateOrUpdateIndex(indexName, projectionDocumentSchema);
+        }, CancellationToken.None);
     }
 
     protected override async Task DropIndex(string indexName, CancellationToken cancellationToken = default)
     {
-        await _client.Indices.DeleteAsync(new DeleteIndexRequest(indexName), cancellationToken);
+        await ExecuteWithRetriesAsync(async (ct) =>
+        {
+            await _client.Indices.DeleteAsync(new DeleteIndexRequest(indexName), ct);
+        }, cancellationToken);
     }
 
     protected override async Task<Dictionary<string, object?>?> SingleInternal(
@@ -236,30 +285,33 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         CancellationToken cancellationToken = default
     )
     {
-        try
+        return await ExecuteWithRetriesAsync(async (ct) =>
         {
-            var item = await _client.GetAsync<Dictionary<string, object?>>(
-                id,
-                x => x.Index(indexDescriptor.IndexName).Routing(partitionKey),
-                ct: cancellationToken
-            );
-
-            if (item?.Source == null)
+            try
             {
-                return null;
+                var item = await _client.GetAsync<Dictionary<string, object?>>(
+                    id,
+                    x => x.Index(indexDescriptor.IndexName).Routing(partitionKey),
+                    ct: ct
+                );
+
+                if (item?.Source == null)
+                {
+                    return null;
+                }
+
+                return DeserializeDictionary(item.Source);
             }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Failed to retrieve document with {@Id} ({@Index})", id, indexDescriptor
+                );
 
-            return DeserializeDictionary(item.Source);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(
-                ex,
-                "Failed to retrieve document with {@Id} ({@Index})", id, indexDescriptor
-            );
-
-            throw;
-        }
+                throw;
+            }
+        }, cancellationToken);
     }
 
     protected override async Task DeleteInternal(
@@ -269,25 +321,28 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         CancellationToken cancellationToken = default
     )
     {
-        try
+        await ExecuteWithRetriesAsync(async (ct) =>
         {
-            await _client.DeleteAsync(
-                new DeleteRequest(indexDescriptor.IndexName, id)
-                {
-                    Routing = new Routing(partitionKey)
-                },
-                cancellationToken
-            );
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(
-                ex,
-                "Failed to delete Document with {@Id} ({@Index})", id, indexDescriptor
-            );
+            try
+            {
+                await _client.DeleteAsync(
+                    new DeleteRequest(indexDescriptor.IndexName, id)
+                    {
+                        Routing = new Routing(partitionKey)
+                    },
+                    ct
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Failed to delete Document with {@Id} ({@Index})", id, indexDescriptor
+                );
 
-            throw;
-        }
+                throw;
+            }
+        }, cancellationToken);
     }
 
     public override async Task DeleteAll(
@@ -301,44 +356,46 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         {
             return;
         }
-        
+
         foreach (var indexStatus in indexState.IndexesStatuses)
         {
-            try
+            await ExecuteWithRetriesAsync(async (ct) =>
             {
-                if (partitionKey == null)
+                try
                 {
-                    await _client.Indices.DeleteAsync(new DeleteIndexRequest(indexStatus.IndexName), cancellationToken);
-                }
-                else
-                {
-                    await _client.DeleteByQueryAsync<Dictionary<string, object?>>(
-                        x => x.Query(
-                                q => q.Bool(
-                                    b => new BoolQuery
-                                    {
-                                        Filter = new List<QueryContainer>
+                    if (partitionKey == null)
+                    {
+                        await _client.Indices.DeleteAsync(new DeleteIndexRequest(indexStatus.IndexName), ct);
+                    }
+                    else
+                    {
+                        await _client.DeleteByQueryAsync<Dictionary<string, object?>>(
+                            x => x.Query(
+                                    q => q.Bool(
+                                        b => new BoolQuery
                                         {
-                                            new TermQuery { Field = nameof(partitionKey), Value = partitionKey }
+                                            Filter = new List<QueryContainer>
+                                            {
+                                                new TermQuery { Field = nameof(partitionKey), Value = partitionKey }
+                                            }
                                         }
-                                    }
+                                    )
                                 )
-                            )
-                            .Routing(partitionKey),
-                        cancellationToken
-                    );
+                                .Routing(partitionKey),
+                            ct
+                        );
+                    }
                 }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to delete index {@Index}", indexStatus.IndexName);
-                throw;
-            }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to delete index {@Index}", indexStatus.IndexName);
+                    throw;
+                }
+            }, cancellationToken);
         }
-        
+
         indexState.IndexesStatuses.Clear();
         await SaveProjectionIndexState(indexState);
-        //await _client.Indices.DeleteAsync(new DeleteIndexRequest(PROJECTION_INDEX_STATE_INDEX_NAME), cancellationToken);
     }
 
     protected override async Task UpsertInternal(
@@ -348,33 +405,36 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         DateTime updatedAt,
         CancellationToken cancellationToken = default)
     {
-        try
+        await ExecuteWithRetriesAsync(async (ct) =>
         {
-            document.TryGetValue("Id", out object? id);
-            document[nameof(ProjectionDocument.PartitionKey)] = partitionKey;
-            document[nameof(ProjectionDocument.UpdatedAt)] = updatedAt;
+            try
+            {
+                document.TryGetValue("Id", out object? id);
+                document[nameof(ProjectionDocument.PartitionKey)] = partitionKey;
+                document[nameof(ProjectionDocument.UpdatedAt)] = updatedAt;
 
-            await _client.IndexAsync(
-                new IndexRequest<Dictionary<string, object?>>(document, indexDescriptor.IndexName, id: id?.ToString())
-                {
-                    Routing = new Routing(partitionKey),
-                    Refresh = Refresh.False,
-                    RequestConfiguration = new RequestConfiguration() {
-                        ThrowExceptions = true
-                    }
-                },
-                cancellationToken
-            );
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(
-                ex,
-                "Failed to upsert Document with {@Id} ({@Index})", document[_projectionDocumentSchema.KeyColumnName], indexDescriptor.IndexName
-            );
+                await _client.IndexAsync(
+                    new IndexRequest<Dictionary<string, object?>>(document, indexDescriptor.IndexName, id: id?.ToString())
+                    {
+                        Routing = new Routing(partitionKey),
+                        Refresh = Refresh.False,
+                        RequestConfiguration = new RequestConfiguration() {
+                            ThrowExceptions = true
+                        }
+                    },
+                    ct
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Failed to upsert Document with {@Id} ({@Index})", document[_projectionDocumentSchema.KeyColumnName], indexDescriptor.IndexName
+                );
 
-            throw;
-        }
+                throw;
+            }
+        }, cancellationToken);
     }
 
     /// <summary>
@@ -387,41 +447,44 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
     {
         if (items.Count == 0) return;
 
-        var bulkDescriptor = new BulkDescriptor()
-            .Index(indexDescriptor.IndexName)
-            .Refresh(Refresh.False);
-
-        foreach (var item in items)
+        await ExecuteWithRetriesAsync(async (ct) =>
         {
-            var doc = item.Document;
-            doc[nameof(ProjectionDocument.PartitionKey)] = item.PartitionKey;
-            doc[nameof(ProjectionDocument.UpdatedAt)] = item.UpdatedAt;
+            var bulkDescriptor = new BulkDescriptor()
+                .Index(indexDescriptor.IndexName)
+                .Refresh(Refresh.False);
 
-            bulkDescriptor.Index<Dictionary<string, object?>>(op => op
-                .Document(doc)
-                .Id(item.Id)
-                .Routing(new Routing(item.PartitionKey))
-            );
-        }
-
-        try
-        {
-            var response = await _client.BulkAsync(bulkDescriptor, cancellationToken);
-
-            if (response.Errors)
+            foreach (var item in items)
             {
-                var firstError = response.ItemsWithErrors.FirstOrDefault();
-                throw new Exception(
-                    $"ElasticSearch _bulk operation had errors on \"{indexDescriptor.IndexName}\". " +
-                    $"First error: {firstError?.Error?.Type} - {firstError?.Error?.Reason}"
+                var doc = item.Document;
+                doc[nameof(ProjectionDocument.PartitionKey)] = item.PartitionKey;
+                doc[nameof(ProjectionDocument.UpdatedAt)] = item.UpdatedAt;
+
+                bulkDescriptor.Index<Dictionary<string, object?>>(op => op
+                    .Document(doc)
+                    .Id(item.Id)
+                    .Routing(new Routing(item.PartitionKey))
                 );
             }
-        }
-        catch (Exception ex) when (ex is not Exception { Message: var m } || !m.StartsWith("ElasticSearch _bulk"))
-        {
-            _logger.LogError(ex, "FlushBufferAsync failed on ({@Index})", indexDescriptor.IndexName);
-            throw;
-        }
+
+            try
+            {
+                var response = await _client.BulkAsync(bulkDescriptor, ct);
+
+                if (response.Errors)
+                {
+                    var firstError = response.ItemsWithErrors.FirstOrDefault();
+                    throw new Exception(
+                        $"ElasticSearch _bulk operation had errors on \"{indexDescriptor.IndexName}\". " +
+                        $"First error: {firstError?.Error?.Type} - {firstError?.Error?.Reason}"
+                    );
+                }
+            }
+            catch (Exception ex) when (ex is not Exception { Message: var m } || !m.StartsWith("ElasticSearch _bulk"))
+            {
+                _logger.LogError(ex, "FlushBufferAsync failed on ({@Index})", indexDescriptor.IndexName);
+                throw;
+            }
+        }, cancellationToken);
     }
 
     protected override async Task<ProjectionQueryResult<Dictionary<string, object?>>> QueryInternal(
@@ -430,71 +493,64 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         string? partitionKey = null,
         CancellationToken cancellationToken = default
     ) {
-        try
+        return await ExecuteWithRetriesAsync(async (ct) =>
         {
-            var result = await _client.SearchAsync<Dictionary<string, object?>>(
-                request =>
-                {
-                    request = request.Index(indexDescriptor.IndexName);
-
-                    request = request.TrackTotalHits();
-                    request = request.Query(q => ConstructSearchQuery(q, projectionQuery));
-                    request = request.Sort(s => ConstructSort(s, projectionQuery));
-                    request = request.Skip(projectionQuery.Offset);
-
-                    if (projectionQuery.Limit.HasValue)
-                    {
-                        request = request.Take(projectionQuery.Limit.Value);
-                    }
-
-                    if (!string.IsNullOrEmpty(partitionKey))
-                    {
-                        request = request.Routing(partitionKey);
-                    }
-
-                    if (_disableRequestStreaming)
-                    {
-                        request = request.RequestConfiguration(conf => conf.DisableDirectStreaming());
-                    }
-
-                    return request;
-                }
-            );
-
-            // if (result.ApiCall.HttpStatusCode == 404 && indexDescriptor.IndexName == PROJECTION_INDEX_STATE_INDEX_NAME)
-            // {
-            //     // usually parent class receives InvalidSchemaException when saving projection index state
-            //     // but that doesn't work for elasticsearch since it's .Index method never returns errors - it simply queues the operation
-            //     await CreateIndex(
-            //         PROJECTION_INDEX_STATE_INDEX_NAME,
-            //         ProjectionIndexStateSchema
-            //     );
-            // }
-
-            return new ProjectionQueryResult<Dictionary<string, object?>>
+            try
             {
-                IndexName = indexDescriptor.IndexName,
-                TotalRecordsFound = (int)result.Total,
-                Records = result.Documents.Select(
-                        x =>
-                            new QueryResultDocument<Dictionary<string, object?>>
-                            {
-                                Document = DeserializeDictionary(x)
-                            }
-                    )
-                    .ToList(),
-                DebugInformation = result.DebugInformation
-            };
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(
-                ex,
-                "Error querying index ({@Index})", indexDescriptor.IndexName
-            );
+                var result = await _client.SearchAsync<Dictionary<string, object?>>(
+                    request =>
+                    {
+                        request = request.Index(indexDescriptor.IndexName);
 
-            throw;
-        }
+                        request = request.TrackTotalHits();
+                        request = request.Query(q => ConstructSearchQuery(q, projectionQuery));
+                        request = request.Sort(s => ConstructSort(s, projectionQuery));
+                        request = request.Skip(projectionQuery.Offset);
+
+                        if (projectionQuery.Limit.HasValue)
+                        {
+                            request = request.Take(projectionQuery.Limit.Value);
+                        }
+
+                        if (!string.IsNullOrEmpty(partitionKey))
+                        {
+                            request = request.Routing(partitionKey);
+                        }
+
+                        if (_disableRequestStreaming)
+                        {
+                            request = request.RequestConfiguration(conf => conf.DisableDirectStreaming());
+                        }
+
+                        return request;
+                    }
+                );
+
+                return new ProjectionQueryResult<Dictionary<string, object?>>
+                {
+                    IndexName = indexDescriptor.IndexName,
+                    TotalRecordsFound = (int)result.Total,
+                    Records = result.Documents.Select(
+                            x =>
+                                new QueryResultDocument<Dictionary<string, object?>>
+                                {
+                                    Document = DeserializeDictionary(x)
+                                }
+                        )
+                        .ToList(),
+                    DebugInformation = result.DebugInformation
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Error querying index ({@Index})", indexDescriptor.IndexName
+                );
+
+                throw;
+            }
+        }, cancellationToken);
     }
     
     private Dictionary<string, object?> DeserializeDictionary(Dictionary<string, object?> document)
@@ -530,7 +586,7 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
             PROJECTION_INDEX_STATE_INDEX_NAME,
             ProjectionIndexStateSchema
         );
-        
+
         var document = ProjectionDocumentSerializer.SerializeToDictionary(state);
         document.TryGetValue("Id", out object? id);
         document[nameof(ProjectionDocument.PartitionKey)] = PROJECTION_INDEX_STATE_INDEX_NAME;
@@ -538,16 +594,19 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
 
         try
         {
-            await _client.IndexAsync(
-                new IndexRequest<Dictionary<string, object?>>(document, PROJECTION_INDEX_STATE_INDEX_NAME, id: id?.ToString())
-                {
-                    Routing = new Routing(PROJECTION_INDEX_STATE_INDEX_NAME),
-                    Refresh = Refresh.True,
-                    RequestConfiguration = new RequestConfiguration() {
-                        ThrowExceptions = true
+            await ExecuteWithRetriesAsync(async (_) =>
+            {
+                await _client.IndexAsync(
+                    new IndexRequest<Dictionary<string, object?>>(document, PROJECTION_INDEX_STATE_INDEX_NAME, id: id?.ToString())
+                    {
+                        Routing = new Routing(PROJECTION_INDEX_STATE_INDEX_NAME),
+                        Refresh = Refresh.True,
+                        RequestConfiguration = new RequestConfiguration() {
+                            ThrowExceptions = true
+                        }
                     }
-                }
-            );
+                );
+            }, CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -557,7 +616,7 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
                     PROJECTION_INDEX_STATE_INDEX_NAME,
                     ProjectionIndexStateSchema
                 );
-                
+
                 await SaveProjectionIndexState(state);
             }
             catch (Exception createTableException)
@@ -641,65 +700,68 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
         CancellationToken cancellationToken = default
     )
     {
-        try
+        return await ExecuteWithRetriesAsync(async (ct) =>
         {
-            // Build Painless script for setting each property
-            var scriptParts = new List<string>();
-            var scriptParams = new Dictionary<string, object?>();
-
-            foreach (var (propName, propValue) in propertyUpdates)
+            try
             {
-                scriptParts.Add($"ctx._source.{propName} = params.{propName}");
-                scriptParams[propName] = propValue;
-            }
+                // Build Painless script for setting each property
+                var scriptParts = new List<string>();
+                var scriptParams = new Dictionary<string, object?>();
 
-            scriptParts.Add($"ctx._source.{nameof(ProjectionDocument.UpdatedAt)} = params._updatedAt");
-            scriptParams["_updatedAt"] = updatedAt;
-
-            // Build filter query
-            var filters = query.Filters != null && query.Filters.Any()
-                ? ElasticSearchFilterFactory.ConstructFilters(query.Filters, _projectionDocumentSchema)
-                : new List<QueryContainer>();
-
-            if (!string.IsNullOrEmpty(partitionKey))
-            {
-                filters.Add(new TermQuery
+                foreach (var (propName, propValue) in propertyUpdates)
                 {
-                    Field = nameof(ProjectionDocument.PartitionKey),
-                    Value = partitionKey
-                });
-            }
+                    scriptParts.Add($"ctx._source.{propName} = params.{propName}");
+                    scriptParams[propName] = propValue;
+                }
 
-            // Refresh the index to ensure all pending writes are searchable
-            // before running the update_by_query. Without this, documents inserted
-            // immediately before (e.g. during event replay) may not be found.
-            await _client.Indices.RefreshAsync(indexDescriptor.IndexName, ct: cancellationToken);
+                scriptParts.Add($"ctx._source.{nameof(ProjectionDocument.UpdatedAt)} = params._updatedAt");
+                scriptParams["_updatedAt"] = updatedAt;
 
-            var response = await _client.UpdateByQueryAsync<Dictionary<string, object?>>(u =>
-            {
-                u = u.Index(indexDescriptor.IndexName)
-                    .Query(q => q.Bool(b => new BoolQuery { Filter = filters }))
-                    .Script(s => s
-                        .Source(string.Join("; ", scriptParts))
-                        .Params(scriptParams!)
-                    )
-                    .Refresh();
+                // Build filter query
+                var filters = query.Filters != null && query.Filters.Any()
+                    ? ElasticSearchFilterFactory.ConstructFilters(query.Filters, _projectionDocumentSchema)
+                    : new List<QueryContainer>();
 
                 if (!string.IsNullOrEmpty(partitionKey))
                 {
-                    u = u.Routing(partitionKey);
+                    filters.Add(new TermQuery
+                    {
+                        Field = nameof(ProjectionDocument.PartitionKey),
+                        Value = partitionKey
+                    });
                 }
 
-                return u;
-            }, cancellationToken);
+                // Refresh the index to ensure all pending writes are searchable
+                // before running the update_by_query. Without this, documents inserted
+                // immediately before (e.g. during event replay) may not be found.
+                await _client.Indices.RefreshAsync(indexDescriptor.IndexName, ct: ct);
 
-            return response.Updated;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to execute UpdateByQuery on ({@Index})", indexDescriptor.IndexName);
-            throw;
-        }
+                var response = await _client.UpdateByQueryAsync<Dictionary<string, object?>>(u =>
+                {
+                    u = u.Index(indexDescriptor.IndexName)
+                        .Query(q => q.Bool(b => new BoolQuery { Filter = filters }))
+                        .Script(s => s
+                            .Source(string.Join("; ", scriptParts))
+                            .Params(scriptParams!)
+                        )
+                        .Refresh();
+
+                    if (!string.IsNullOrEmpty(partitionKey))
+                    {
+                        u = u.Routing(partitionKey);
+                    }
+
+                    return u;
+                }, ct);
+
+                return response.Updated;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to execute UpdateByQuery on ({@Index})", indexDescriptor.IndexName);
+                throw;
+            }
+        }, cancellationToken);
     }
 
     private QueryContainer ConstructSearchQuery<T>(QueryContainerDescriptor<T> searchDescriptor, ProjectionQuery projectionQuery) where T : class

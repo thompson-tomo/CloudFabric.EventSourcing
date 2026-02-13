@@ -11,6 +11,7 @@ public abstract class ProjectionRepositoryFactory
 
     private bool _batchModeActive;
     private ProjectionOperationIndexSelector _batchIndexSelector = ProjectionOperationIndexSelector.Write;
+    private BatchBufferOptions? _batchBufferOptions;
 
     public ProjectionRepositoryFactory(ILoggerFactory loggerFactory)
     {
@@ -38,6 +39,7 @@ public abstract class ProjectionRepositoryFactory
         // Auto-enable batch on newly cached repos when factory is in batch mode
         if (_batchModeActive)
         {
+            if (_batchBufferOptions != null) repository.BatchBufferOptions = _batchBufferOptions;
             repository.BeginBatch(_batchIndexSelector);
         }
     }
@@ -63,6 +65,7 @@ public abstract class ProjectionRepositoryFactory
         // Auto-enable batch on newly cached repos when factory is in batch mode
         if (_batchModeActive)
         {
+            if (_batchBufferOptions != null) repository.BatchBufferOptions = _batchBufferOptions;
             repository.BeginBatch(_batchIndexSelector);
         }
     }
@@ -94,13 +97,20 @@ public abstract class ProjectionRepositoryFactory
     /// <param name="indexSelector">
     /// Which index to target when flushing. Use <see cref="ProjectionOperationIndexSelector.ProjectionRebuild"/> during rebuild.
     /// </param>
-    public void BeginBatchOnAll(ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write)
+    public void BeginBatchOnAll(
+        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write,
+        BatchBufferOptions? bufferOptions = null)
     {
         _batchModeActive = true;
         _batchIndexSelector = indexSelector;
+        _batchBufferOptions = bufferOptions;
         foreach (var repo in _repositories.Values)
         {
-            if (repo is IProjectionRepository r) r.BeginBatch(indexSelector);
+            if (repo is IProjectionRepository r)
+            {
+                if (bufferOptions != null) r.BatchBufferOptions = bufferOptions;
+                r.BeginBatch(indexSelector);
+            }
         }
     }
 

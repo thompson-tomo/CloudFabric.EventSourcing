@@ -1,4 +1,8 @@
+using CloudFabric.Projections.Resilience;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
+using Polly;
 
 namespace CloudFabric.EventSourcing.EventStore.Postgresql;
 
@@ -7,6 +11,17 @@ public class PostgresqlSequenceGenerator : ISequenceGenerator
     private readonly PostgresqlEventStoreConnectionInformation _connectionInformation;
     private readonly IPostgresqlEventStoreConnectionInformationProvider? _connectionInformationProvider = null;
     private readonly string _tableName;
+
+    private readonly ResiliencePipeline _retryPipeline;
+    private readonly ILogger<PostgresqlSequenceGenerator> _logger;
+
+    private static readonly HashSet<string> TransientSqlStates = new()
+    {
+        "08000", "08001", "08003", "08004", "08006", "40001", "40P01", "57P03", "53300"
+    };
+
+    private static bool IsTransientSqlState(string? sqlState) =>
+        sqlState != null && TransientSqlStates.Contains(sqlState);
 
     private PostgresqlEventStoreConnectionInformation ConnectionInformation
     {
@@ -23,49 +38,74 @@ public class PostgresqlSequenceGenerator : ISequenceGenerator
         }
     }
 
-    public PostgresqlSequenceGenerator(string connectionString, string tableName)
+    public PostgresqlSequenceGenerator(
+        string connectionString,
+        string tableName,
+        ResilienceSettings? resilienceSettings = null,
+        ILogger<PostgresqlSequenceGenerator>? logger = null)
     {
         _tableName = tableName;
         _connectionInformation = new PostgresqlEventStoreConnectionInformation()
         {
             ConnectionString = connectionString
         };
+        _logger = logger ?? NullLogger<PostgresqlSequenceGenerator>.Instance;
+        _retryPipeline = BuildRetryPipeline(resilienceSettings ?? ResilienceSettings.Default);
     }
 
     public PostgresqlSequenceGenerator(
         IPostgresqlEventStoreConnectionInformationProvider connectionInformationProvider,
-        string tableName = "sequence_counters"
+        string tableName = "sequence_counters",
+        ResilienceSettings? resilienceSettings = null,
+        ILogger<PostgresqlSequenceGenerator>? logger = null
     )
     {
         _tableName = tableName;
         _connectionInformationProvider = connectionInformationProvider;
+        _logger = logger ?? NullLogger<PostgresqlSequenceGenerator>.Instance;
+        _retryPipeline = BuildRetryPipeline(resilienceSettings ?? ResilienceSettings.Default);
+    }
+
+    private ResiliencePipeline BuildRetryPipeline(ResilienceSettings settings)
+    {
+        var shouldHandle = new PredicateBuilder<object>()
+            .Handle<NpgsqlException>(ex => ex.IsTransient || IsTransientSqlState(ex.SqlState))
+            .Handle<TimeoutException>();
+
+        return ResiliencePipelineFactory.Create(settings, shouldHandle, _logger, "PostgresqlSequenceGenerator");
     }
 
     public async Task Initialize(CancellationToken cancellationToken = default)
     {
-        await EnsureTableExistsAsync(cancellationToken);
+        await _retryPipeline.ExecuteAsync(async (ct) =>
+        {
+            await EnsureTableExistsAsync(ct);
+        }, cancellationToken);
     }
 
     public async Task DeleteAll(CancellationToken cancellationToken = default)
     {
-        var connectionInformation = ConnectionInformation;
-
-        await using var conn = new NpgsqlConnection(connectionInformation.ConnectionString);
-        await conn.OpenAsync(cancellationToken);
-
-        await using var cmd = new NpgsqlCommand($"DELETE FROM \"{_tableName}\"", conn);
-
-        try
+        await _retryPipeline.ExecuteAsync(async (ct) =>
         {
-            await cmd.ExecuteNonQueryAsync(cancellationToken);
-        }
-        catch (NpgsqlException ex)
-        {
-            if (ex.SqlState != PostgresErrorCodes.UndefinedTable)
+            var connectionInformation = ConnectionInformation;
+
+            await using var conn = new NpgsqlConnection(connectionInformation.ConnectionString);
+            await conn.OpenAsync(ct);
+
+            await using var cmd = new NpgsqlCommand($"DELETE FROM \"{_tableName}\"", conn);
+
+            try
             {
-                throw;
+                await cmd.ExecuteNonQueryAsync(ct);
             }
-        }
+            catch (NpgsqlException ex)
+            {
+                if (ex.SqlState != PostgresErrorCodes.UndefinedTable)
+                {
+                    throw;
+                }
+            }
+        }, cancellationToken);
     }
 
     public async Task<long> GetNextValue(
@@ -76,46 +116,49 @@ public class PostgresqlSequenceGenerator : ISequenceGenerator
         CancellationToken cancellationToken = default
     )
     {
-        var connectionInformation = ConnectionInformation;
-
-        await using var conn = new NpgsqlConnection(connectionInformation.ConnectionString);
-        await conn.OpenAsync(cancellationToken);
-
-        await using var cmd = new NpgsqlCommand(
-            $"INSERT INTO \"{_tableName}\" (sequence_name, partition_key, current_value) " +
-            $"VALUES (@sequence_name, @partition_key, @starting_number) " +
-            $"ON CONFLICT (sequence_name, partition_key) " +
-            $"DO UPDATE SET current_value = \"{_tableName}\".current_value + @increment " +
-            $"RETURNING current_value",
-            conn
-        )
+        return await _retryPipeline.ExecuteAsync(async (ct) =>
         {
-            Parameters =
+            var connectionInformation = ConnectionInformation;
+
+            await using var conn = new NpgsqlConnection(connectionInformation.ConnectionString);
+            await conn.OpenAsync(ct);
+
+            await using var cmd = new NpgsqlCommand(
+                $"INSERT INTO \"{_tableName}\" (sequence_name, partition_key, current_value) " +
+                $"VALUES (@sequence_name, @partition_key, @starting_number) " +
+                $"ON CONFLICT (sequence_name, partition_key) " +
+                $"DO UPDATE SET current_value = \"{_tableName}\".current_value + @increment " +
+                $"RETURNING current_value",
+                conn
+            )
             {
-                new("sequence_name", sequenceName),
-                new("partition_key", partitionKey),
-                new("starting_number", startingNumber),
-                new("increment", increment)
-            }
-        };
+                Parameters =
+                {
+                    new("sequence_name", sequenceName),
+                    new("partition_key", partitionKey),
+                    new("starting_number", startingNumber),
+                    new("increment", increment)
+                }
+            };
 
-        try
-        {
-            var result = await cmd.ExecuteScalarAsync(cancellationToken);
-            return (long)result!;
-        }
-        catch (NpgsqlException ex)
-        {
-            if (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+            try
             {
-                throw new Exception(
-                    "Sequence table not found, please make sure to call Initialize() on sequence generator first.",
-                    ex
-                );
+                var result = await cmd.ExecuteScalarAsync(ct);
+                return (long)result!;
             }
+            catch (NpgsqlException ex)
+            {
+                if (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+                {
+                    throw new Exception(
+                        "Sequence table not found, please make sure to call Initialize() on sequence generator first.",
+                        ex
+                    );
+                }
 
-            throw;
-        }
+                throw;
+            }
+        }, cancellationToken);
     }
 
     private async Task EnsureTableExistsAsync(CancellationToken cancellationToken = default)

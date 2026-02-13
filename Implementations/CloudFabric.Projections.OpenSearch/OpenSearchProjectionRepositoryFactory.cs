@@ -1,3 +1,4 @@
+using CloudFabric.Projections.Resilience;
 using Microsoft.Extensions.Logging;
 
 namespace CloudFabric.Projections.OpenSearch;
@@ -8,6 +9,7 @@ public class OpenSearchProjectionRepositoryFactory : ProjectionRepositoryFactory
     private readonly OpenSearchBasicAuthConnectionSettings? _basicAuthConnectionSettings;
     private readonly OpenSearchAwsAuthConnectionSettings? _awsAuthConnectionSettings;
     private readonly bool _disableRequestStreaming;
+    private readonly ResilienceSettings? _resilienceSettings;
 
     /// <summary>
     ///
@@ -20,15 +22,20 @@ public class OpenSearchProjectionRepositoryFactory : ProjectionRepositoryFactory
     ///
     /// Defaults to false to improve performance.
     /// </param>
+    /// <param name="resilienceSettings">
+    /// Optional retry/circuit-breaker settings forwarded to each repository instance.
+    /// </param>
     public OpenSearchProjectionRepositoryFactory(
         OpenSearchBasicAuthConnectionSettings connectionSettings,
         ILoggerFactory loggerFactory,
-        bool disableRequestStreaming = false
+        bool disableRequestStreaming = false,
+        ResilienceSettings? resilienceSettings = null
     ): base(loggerFactory)
     {
         _basicAuthConnectionSettings = connectionSettings;
         _loggerFactory = loggerFactory;
         _disableRequestStreaming = disableRequestStreaming;
+        _resilienceSettings = resilienceSettings;
     }
 
     /// <summary>
@@ -42,15 +49,20 @@ public class OpenSearchProjectionRepositoryFactory : ProjectionRepositoryFactory
     ///
     /// Defaults to false to improve performance.
     /// </param>
+    /// <param name="resilienceSettings">
+    /// Optional retry/circuit-breaker settings forwarded to each repository instance.
+    /// </param>
     public OpenSearchProjectionRepositoryFactory(
         OpenSearchAwsAuthConnectionSettings awsAuthConnectionSettings,
         ILoggerFactory loggerFactory,
-        bool disableRequestStreaming = false
+        bool disableRequestStreaming = false,
+        ResilienceSettings? resilienceSettings = null
     ): base(loggerFactory)
     {
         _loggerFactory = loggerFactory;
         _awsAuthConnectionSettings = awsAuthConnectionSettings;
         _disableRequestStreaming = disableRequestStreaming;
+        _resilienceSettings = resilienceSettings;
     }
 
     public override IProjectionRepository<TProjectionDocument> GetProjectionRepository<TProjectionDocument>()
@@ -67,13 +79,15 @@ public class OpenSearchProjectionRepositoryFactory : ProjectionRepositoryFactory
             repository = new OpenSearchProjectionRepository<TProjectionDocument>(
                 _basicAuthConnectionSettings,
                 _loggerFactory,
-                _disableRequestStreaming
+                _disableRequestStreaming,
+                _resilienceSettings
             );
         }
         else if (_awsAuthConnectionSettings != null)
         {
             repository = new OpenSearchProjectionRepository<TProjectionDocument>(
-                _awsAuthConnectionSettings, _loggerFactory, _disableRequestStreaming
+                _awsAuthConnectionSettings, _loggerFactory, _disableRequestStreaming,
+                _resilienceSettings
             );
         }
 
@@ -101,7 +115,8 @@ public class OpenSearchProjectionRepositoryFactory : ProjectionRepositoryFactory
                 _basicAuthConnectionSettings,
                 projectionDocumentSchema,
                 _loggerFactory,
-                _disableRequestStreaming
+                _disableRequestStreaming,
+                _resilienceSettings
             );
         }
         else if (_awsAuthConnectionSettings != null)
@@ -110,7 +125,8 @@ public class OpenSearchProjectionRepositoryFactory : ProjectionRepositoryFactory
                 _awsAuthConnectionSettings,
                 projectionDocumentSchema,
                 _loggerFactory,
-                _disableRequestStreaming
+                _disableRequestStreaming,
+                _resilienceSettings
             );
         }
 

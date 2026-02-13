@@ -1,3 +1,4 @@
+using CloudFabric.EventSourcing.AspNet.Postgresql.HealthChecks;
 using CloudFabric.EventSourcing.Domain;
 using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.EventStore.Postgresql;
@@ -5,6 +6,7 @@ using CloudFabric.Projections;
 using CloudFabric.Projections.Postgresql;
 using CloudFabric.Projections.Worker;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -72,7 +74,12 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
 
                     if (projectionsRepositoryFactory != null && builder.ProjectionBuilderFactories != null)
                     {
-                        scope.ProjectionsEngine = new ProjectionsEngine(scope.EventsObserver);
+                        var errorHandler = sp.GetService<IProjectionErrorHandler>();
+                        scope.ProjectionsEngine = new ProjectionsEngine(
+                            scope.EventsObserver,
+                            sp.GetRequiredService<ILogger<ProjectionsEngine>>(),
+                            errorHandler
+                        );
 
                         foreach (var factory in builder.ProjectionBuilderFactories)
                         {
@@ -203,6 +210,8 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
                 {
                     var rebuildProcessorScope = sp.CreateScope();
 
+                    var distributedLock = rebuildProcessorScope.ServiceProvider.GetService<IDistributedLock>();
+
                     var processor = new ProjectionsRebuildProcessor(
                         rebuildProcessorScope.ServiceProvider.GetRequiredKeyedService<ProjectionRepositoryFactory>(builder.EventStoreKey)
                             .GetProjectionsIndexStateRepository(),
@@ -221,7 +230,12 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
                                 rebuildProcessorScope.ServiceProvider.GetRequiredService<ILogger<PostgresqlEventStoreEventObserver>>()
                             );
 
-                            var projectionsEngine = new ProjectionsEngine(eventObserver);
+                            var rebuildErrorHandler = rebuildProcessorScope.ServiceProvider.GetService<IProjectionErrorHandler>();
+                            var projectionsEngine = new ProjectionsEngine(
+                                eventObserver,
+                                rebuildProcessorScope.ServiceProvider.GetRequiredService<ILogger<ProjectionsEngine>>(),
+                                rebuildErrorHandler
+                            );
 
                             if (b.ProjectionBuilderFactories != null)
                             {
@@ -240,7 +254,8 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
                             return projectionsEngine;
                         },
                         rebuildProcessorScope.ServiceProvider.GetRequiredService<ILogger<ProjectionsRebuildProcessor>>(),
-                        metadataRepository: rebuildProcessorScope.ServiceProvider.GetRequiredKeyedService<IMetadataRepository>(builder.EventStoreKey)
+                        metadataRepository: rebuildProcessorScope.ServiceProvider.GetRequiredKeyedService<IMetadataRepository>(builder.EventStoreKey),
+                        distributedLock: distributedLock
                     );
 
                     var options = sp.GetRequiredService<IOptions<ProjectionsRebuildProcessorOptions>>();
@@ -253,6 +268,49 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
             );
 
             return builder;
+        }
+
+        /// <summary>
+        /// Registers PostgreSQL advisory lock as <see cref="IDistributedLock"/>.
+        /// Used by <see cref="ProjectionsRebuildProcessor"/> to prevent concurrent rebuilds across instances.
+        /// </summary>
+        public static IEventSourcingBuilder UsePostgresqlDistributedLock(
+            this IEventSourcingBuilder builder,
+            string connectionString)
+        {
+            builder.Services.AddSingleton<IDistributedLock>(
+                new PostgresqlDistributedLock(connectionString));
+
+            return builder;
+        }
+
+        /// <summary>
+        /// Adds health checks for PostgreSQL event store and projections connectivity.
+        /// </summary>
+        public static IHealthChecksBuilder AddPostgresqlEventSourcingHealthChecks(
+            this IHealthChecksBuilder healthChecksBuilder,
+            string eventsConnectionString,
+            string eventsTableName,
+            string? projectionsConnectionString = null)
+        {
+            healthChecksBuilder.Add(new HealthCheckRegistration(
+                "postgresql-eventstore",
+                _ => new PostgresqlEventStoreHealthCheck(eventsConnectionString, eventsTableName),
+                failureStatus: HealthStatus.Unhealthy,
+                tags: new[] { "ready", "eventstore" }
+            ));
+
+            if (projectionsConnectionString != null)
+            {
+                healthChecksBuilder.Add(new HealthCheckRegistration(
+                    "postgresql-projections",
+                    _ => new PostgresqlProjectionsHealthCheck(projectionsConnectionString),
+                    failureStatus: HealthStatus.Unhealthy,
+                    tags: new[] { "ready", "projections" }
+                ));
+            }
+
+            return healthChecksBuilder;
         }
     }
 }

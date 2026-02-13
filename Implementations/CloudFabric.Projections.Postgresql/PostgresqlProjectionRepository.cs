@@ -3,10 +3,12 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using CloudFabric.Projections.Exceptions;
 using CloudFabric.Projections.Queries;
+using CloudFabric.Projections.Resilience;
 using CloudFabric.Projections.Utils;
 using Microsoft.Extensions.Logging;
 using Npgsql;
 using NpgsqlTypes;
+using Polly;
 
 namespace CloudFabric.Projections.Postgresql;
 
@@ -21,10 +23,11 @@ public class PostgresqlProjectionRepository<TProjectionDocument> : PostgresqlPro
     where TProjectionDocument : ProjectionDocument
 {
     public PostgresqlProjectionRepository(
-        string connectionString, 
+        string connectionString,
         ILoggerFactory loggerFactory,
-        bool includeDebugInformation = false)
-        : base(connectionString, ProjectionDocumentSchemaFactory.FromTypeWithAttributes<TProjectionDocument>(), loggerFactory, includeDebugInformation)
+        bool includeDebugInformation = false,
+        ResilienceSettings? resilienceSettings = null)
+        : base(connectionString, ProjectionDocumentSchemaFactory.FromTypeWithAttributes<TProjectionDocument>(), loggerFactory, includeDebugInformation, resilienceSettings)
     {
     }
 
@@ -119,15 +122,27 @@ public class PostgresqlProjectionRepository : ProjectionRepository
     private string? _keyPropertyName;
     private string? _tableName;
 
+    private readonly ResiliencePipeline _retryPipeline;
+
+    private static readonly HashSet<string> TransientSqlStates = new()
+    {
+        "08000", "08001", "08003", "08004", "08006", "40001", "40P01", "57P03", "53300"
+    };
+
+    private static bool IsTransientSqlState(string? sqlState) =>
+        sqlState != null && TransientSqlStates.Contains(sqlState);
+
     public PostgresqlProjectionRepository(
         string connectionString,
         ProjectionDocumentSchema projectionDocumentSchema,
         ILoggerFactory loggerFactory,
-        bool includeDebugInformation = false
+        bool includeDebugInformation = false,
+        ResilienceSettings? resilienceSettings = null
     ) : base(projectionDocumentSchema, loggerFactory.CreateLogger<ProjectionRepository>())
     {
         _connectionString = connectionString;
         _includeDebugInformation = includeDebugInformation;
+        _retryPipeline = BuildRetryPipeline(resilienceSettings ?? ResilienceSettings.Default, loggerFactory);
 
         // for dynamic projection document schemas we need to ensure 'partitionKey' column is always there
         if (ProjectionDocumentSchema.Properties.All(p => p.PropertyName != "PartitionKey"))
@@ -139,6 +154,20 @@ public class PostgresqlProjectionRepository : ProjectionRepository
                 IsFilterable = true
             });
         }
+    }
+
+    private ResiliencePipeline BuildRetryPipeline(ResilienceSettings settings, ILoggerFactory loggerFactory)
+    {
+        var shouldHandle = new PredicateBuilder<object>()
+            .Handle<NpgsqlException>(ex => ex.IsTransient || IsTransientSqlState(ex.SqlState))
+            .Handle<TimeoutException>();
+
+        return ResiliencePipelineFactory.Create(
+            settings,
+            shouldHandle,
+            loggerFactory.CreateLogger<PostgresqlProjectionRepository>(),
+            "PostgresqlProjectionRepository"
+        );
     }
 
     public string TableName
@@ -169,45 +198,51 @@ public class PostgresqlProjectionRepository : ProjectionRepository
     
     protected override async Task CreateIndex(string indexName, ProjectionDocumentSchema projectionDocumentSchema)
     {
-        await using var conn = new NpgsqlConnection(_connectionString);
-        await conn.OpenAsync();
-
-        var createTableSql = ConstructCreateTableSql(indexName, projectionDocumentSchema);
-
-        await using var createTableCommand = new NpgsqlCommand(createTableSql, conn);
-        try
+        await _retryPipeline.ExecuteAsync(async (ct) =>
         {
-            await createTableCommand.ExecuteNonQueryAsync();
-        }
-        catch (NpgsqlException ex)
-        {
-            if (ex.SqlState != PostgresErrorCodes.DuplicateTable) // table already created, can be ignored
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(ct);
+
+            var createTableSql = ConstructCreateTableSql(indexName, projectionDocumentSchema);
+
+            await using var createTableCommand = new NpgsqlCommand(createTableSql, conn);
+            try
             {
-                throw;
+                await createTableCommand.ExecuteNonQueryAsync(ct);
             }
-        }
-        catch (Exception createTableException)
-        {
-            var exception = new Exception($"Failed to create a table for projection \"{TableName}\"", createTableException);
-            exception.Data.Add("commandText", createTableSql);
-            throw exception;
-        }
+            catch (NpgsqlException ex)
+            {
+                if (ex.SqlState != PostgresErrorCodes.DuplicateTable) // table already created, can be ignored
+                {
+                    throw;
+                }
+            }
+            catch (Exception createTableException)
+            {
+                var exception = new Exception($"Failed to create a table for projection \"{TableName}\"", createTableException);
+                exception.Data.Add("commandText", createTableSql);
+                throw exception;
+            }
 
-        var createIndexesSql = ConstructCreateIndexesSql(indexName, projectionDocumentSchema);
-        if (!string.IsNullOrEmpty(createIndexesSql))
-        {
-            await using var createIndexesCommand = new NpgsqlCommand(createIndexesSql, conn);
-            await createIndexesCommand.ExecuteNonQueryAsync();
-        }
+            var createIndexesSql = ConstructCreateIndexesSql(indexName, projectionDocumentSchema);
+            if (!string.IsNullOrEmpty(createIndexesSql))
+            {
+                await using var createIndexesCommand = new NpgsqlCommand(createIndexesSql, conn);
+                await createIndexesCommand.ExecuteNonQueryAsync(ct);
+            }
+        }, CancellationToken.None);
     }
 
     protected override async Task DropIndex(string indexName, CancellationToken cancellationToken = default)
     {
-        await using var conn = new NpgsqlConnection(_connectionString);
-        await conn.OpenAsync(cancellationToken);
+        await _retryPipeline.ExecuteAsync(async (ct) =>
+        {
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(ct);
 
-        await using var cmd = new NpgsqlCommand($"DROP TABLE IF EXISTS \"{indexName}\"", conn);
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
+            await using var cmd = new NpgsqlCommand($"DROP TABLE IF EXISTS \"{indexName}\"", conn);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }, cancellationToken);
     }
 
     protected override async Task<Dictionary<string, object?>?> SingleInternal(
@@ -226,9 +261,6 @@ public class PostgresqlProjectionRepository : ProjectionRepository
             throw new ArgumentNullException(nameof(partitionKey));
         }
 
-        await using var conn = new NpgsqlConnection(_connectionString);
-        await conn.OpenAsync(cancellationToken);
-
         if (indexDescriptor.ProjectionDocumentSchema.Properties.Count <= 0)
         {
             throw new ArgumentException(
@@ -237,82 +269,88 @@ public class PostgresqlProjectionRepository : ProjectionRepository
             );
         }
 
-        await using var cmd = new NpgsqlCommand(
-            $"SELECT " +
-            string.Join(',', indexDescriptor.ProjectionDocumentSchema.Properties.Select(p => p.PropertyName)) + " " +
-            $"FROM \"{indexDescriptor.IndexName}\" " +
-            $"WHERE {KeyColumnName} = @id AND {nameof(ProjectionDocument.PartitionKey)} = @partitionKey " +
-            $"LIMIT 1", conn
-        )
+        return await _retryPipeline.ExecuteAsync(async (ct) =>
         {
-            Parameters =
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(ct);
+
+            await using var cmd = new NpgsqlCommand(
+                $"SELECT " +
+                string.Join(',', indexDescriptor.ProjectionDocumentSchema.Properties.Select(p => p.PropertyName)) + " " +
+                $"FROM \"{indexDescriptor.IndexName}\" " +
+                $"WHERE {KeyColumnName} = @id AND {nameof(ProjectionDocument.PartitionKey)} = @partitionKey " +
+                $"LIMIT 1", conn
+            )
             {
-                new(KeyColumnName, id),
-                new("partitionKey", partitionKey)
-            }
-        };
-
-        try
-        {
-            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
-
-            if (reader.HasRows)
-            {
-                var result = new Dictionary<string, object?>();
-
-                while (await reader.ReadAsync(cancellationToken))
+                Parameters =
                 {
-                    var values = new object[indexDescriptor.ProjectionDocumentSchema.Properties.Count];
-                    reader.GetValues(values);
+                    new(KeyColumnName, id),
+                    new("partitionKey", partitionKey)
+                }
+            };
 
-                    if (values.Length <= 0)
+            try
+            {
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+                if (reader.HasRows)
+                {
+                    var result = new Dictionary<string, object?>();
+
+                    while (await reader.ReadAsync(ct))
                     {
-                        return null;
+                        var values = new object[indexDescriptor.ProjectionDocumentSchema.Properties.Count];
+                        reader.GetValues(values);
+
+                        if (values.Length <= 0)
+                        {
+                            return null;
+                        }
+
+                        for (var i = 0; i < indexDescriptor.ProjectionDocumentSchema.Properties.Count; i++)
+                        {
+                            if (values[i] is DBNull)
+                            {
+                                result[indexDescriptor.ProjectionDocumentSchema.Properties[i].PropertyName] = null;
+                            }
+                            // try to check whether the property is a json object or array
+                            else if (
+                                (indexDescriptor.ProjectionDocumentSchema.Properties[i].IsNestedObject || indexDescriptor.ProjectionDocumentSchema.Properties[i].IsNestedArray)
+                                && values[i] is string
+                            )
+                            {
+                                result[indexDescriptor.ProjectionDocumentSchema.Properties[i].PropertyName] =
+                                    JsonToObjectConverter.Convert((string)values[i], indexDescriptor.ProjectionDocumentSchema.Properties[i]);
+                            }
+                            else
+                            {
+                                result[indexDescriptor.ProjectionDocumentSchema.Properties[i].PropertyName] = values[i];
+                            }
+                        }
                     }
 
-                    for (var i = 0; i < indexDescriptor.ProjectionDocumentSchema.Properties.Count; i++)
-                    {
-                        if (values[i] is DBNull)
-                        {
-                            result[indexDescriptor.ProjectionDocumentSchema.Properties[i].PropertyName] = null;
-                        }
-                        // try to check whether the property is a json object or array
-                        else if (
-                            (indexDescriptor.ProjectionDocumentSchema.Properties[i].IsNestedObject || indexDescriptor.ProjectionDocumentSchema.Properties[i].IsNestedArray)
-                            && values[i] is string
-                        )
-                        {
-                            result[indexDescriptor.ProjectionDocumentSchema.Properties[i].PropertyName] = 
-                                JsonToObjectConverter.Convert((string)values[i], indexDescriptor.ProjectionDocumentSchema.Properties[i]);
-                        }
-                        else
-                        {
-                            result[indexDescriptor.ProjectionDocumentSchema.Properties[i].PropertyName] = values[i];
-                        }
-                    }
+                    return result;
                 }
 
-                return result;
+                return null;
+            }
+            catch (NpgsqlException ex)
+            {
+                if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+                {
+                    throw new InvalidProjectionSchemaException(ex);
+                }
+                else
+                {
+                    throw new Exception(
+                        $"Something went terribly wrong while updating/inserting document in \"{TableName}\".",
+                        ex
+                    );
+                }
             }
 
             return null;
-        }
-        catch (NpgsqlException ex)
-        {
-            if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
-            {
-                throw new InvalidProjectionSchemaException(ex);
-            }
-            else 
-            {
-                throw new Exception(
-                    $"Something went terribly wrong while updating/inserting document in \"{TableName}\".",
-                    ex
-                );
-            }
-        }
-
-        return null;
+        }, cancellationToken);
     }
 
     protected override async Task DeleteInternal(
@@ -331,22 +369,25 @@ public class PostgresqlProjectionRepository : ProjectionRepository
             throw new ArgumentNullException(nameof(partitionKey));
         }
 
-        await using var conn = new NpgsqlConnection(_connectionString);
-        await conn.OpenAsync(cancellationToken);
-
-        await using var cmd = new NpgsqlCommand(
-            $"DELETE " +
-            $" FROM \"{indexDescriptor.IndexName}\" WHERE {KeyColumnName} = @id AND {nameof(ProjectionDocument.PartitionKey)} = @partitionKey", conn
-        )
+        await _retryPipeline.ExecuteAsync(async (ct) =>
         {
-            Parameters =
-            {
-                new("id", id),
-                new("partitionKey", partitionKey)
-            }
-        };
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(ct);
 
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
+            await using var cmd = new NpgsqlCommand(
+                $"DELETE " +
+                $" FROM \"{indexDescriptor.IndexName}\" WHERE {KeyColumnName} = @id AND {nameof(ProjectionDocument.PartitionKey)} = @partitionKey", conn
+            )
+            {
+                Parameters =
+                {
+                    new("id", id),
+                    new("partitionKey", partitionKey)
+                }
+            };
+
+            await cmd.ExecuteNonQueryAsync(ct);
+        }, cancellationToken);
     }
 
     public override async Task DeleteAll(
@@ -401,8 +442,8 @@ public class PostgresqlProjectionRepository : ProjectionRepository
 
     protected override async Task UpsertInternal(
         ProjectionOperationIndexDescriptor indexDescriptor,
-        Dictionary<string, object?> document, 
-        string partitionKey, 
+        Dictionary<string, object?> document,
+        string partitionKey,
         DateTime updatedAt,
         CancellationToken cancellationToken = default
     ) {
@@ -410,14 +451,11 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         {
             throw new ArgumentNullException(nameof(document));
         }
-        
+
         if (string.IsNullOrEmpty(partitionKey))
         {
             throw new ArgumentNullException(nameof(partitionKey));
         }
-
-        await using var conn = new NpgsqlConnection(_connectionString);
-        await conn.OpenAsync(cancellationToken);
 
         if (indexDescriptor.ProjectionDocumentSchema.Properties.Count <= 0)
         {
@@ -429,56 +467,66 @@ public class PostgresqlProjectionRepository : ProjectionRepository
 
         document[nameof(ProjectionDocument.PartitionKey)] = partitionKey;
         document[nameof(ProjectionDocument.UpdatedAt)] = updatedAt;
-        
+
         var propertiesToInsert = indexDescriptor.ProjectionDocumentSchema.Properties
             .Where(p => document.Keys.Contains(p.PropertyName)).ToList(); // document may not contain non-required properties,
                                                                           // we need to exclude them from query
-        
+
         var propertyNames = propertiesToInsert
             .Select(p => p.PropertyName)
             .ToArray();
 
-        await using var cmd = new NpgsqlCommand(
-            $"INSERT INTO \"{indexDescriptor.IndexName}\" ({string.Join(',', propertyNames)}) " +
-            $"VALUES ({string.Join(',', propertyNames.Select(p => $"@{p}"))}) " +
-            $"ON CONFLICT ({indexDescriptor.ProjectionDocumentSchema.KeyColumnName}) " +
-            $"DO UPDATE SET {string.Join(',', propertyNames.Select(p => $"{p} = @{p}"))} "
-            , conn
-        );
-
+        // Serialize nested objects/arrays before entering the retry loop
         foreach (var p in propertiesToInsert)
         {
             if (p.IsNestedObject || p.IsNestedArray)
             {
                 document[p.PropertyName] = JsonSerializer.SerializeToDocument(document[p.PropertyName]);
             }
-
-            cmd.Parameters.Add(new(p.PropertyName, document[p.PropertyName] ?? DBNull.Value));
         }
 
-        try
+        await _retryPipeline.ExecuteAsync(async (ct) =>
         {
-            var updatedRows = await cmd.ExecuteNonQueryAsync(cancellationToken);
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(ct);
 
-            if (updatedRows != 1)
+            await using var cmd = new NpgsqlCommand(
+                $"INSERT INTO \"{indexDescriptor.IndexName}\" ({string.Join(',', propertyNames)}) " +
+                $"VALUES ({string.Join(',', propertyNames.Select(p => $"@{p}"))}) " +
+                $"ON CONFLICT ({indexDescriptor.ProjectionDocumentSchema.KeyColumnName}) " +
+                $"DO UPDATE SET {string.Join(',', propertyNames.Select(p => $"{p} = @{p}"))} "
+                , conn
+            );
+
+            foreach (var p in propertiesToInsert)
             {
-                throw new Exception("Something happened with upsert operation: no rows were affected");
+                cmd.Parameters.Add(new(p.PropertyName, document[p.PropertyName] ?? DBNull.Value));
             }
-        }
-        catch (NpgsqlException ex)
-        {
-            if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+
+            try
             {
-                throw new InvalidProjectionSchemaException(ex);
+                var updatedRows = await cmd.ExecuteNonQueryAsync(ct);
+
+                if (updatedRows != 1)
+                {
+                    throw new Exception("Something happened with upsert operation: no rows were affected");
+                }
             }
-            else 
+            catch (NpgsqlException ex)
             {
-                throw new Exception(
-                    $"Something went terribly wrong while updating/inserting document in \"{TableName}\".",
-                    ex
-                );
+                if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+                {
+                    throw new InvalidProjectionSchemaException(ex);
+                }
+                else
+                {
+                    throw new Exception(
+                        $"Something went terribly wrong while updating/inserting document in \"{TableName}\".",
+                        ex
+                    );
+                }
             }
-        }
+        }, cancellationToken);
     }
     
     /// <summary>
@@ -492,80 +540,83 @@ public class PostgresqlProjectionRepository : ProjectionRepository
     {
         if (items.Count == 0) return;
 
-        var propertiesToInsert = indexDescriptor.ProjectionDocumentSchema.Properties;
-        var propertyNames = propertiesToInsert.Select(p => p.PropertyName).ToArray();
-        var keyColumnName = indexDescriptor.ProjectionDocumentSchema.KeyColumnName;
-
-        // PostgreSQL max parameters ~65535; sub-batch to stay within limits
-        var maxParamsPerRow = propertyNames.Length;
-        var maxRowsPerBatch = maxParamsPerRow > 0 ? Math.Max(1, 65000 / maxParamsPerRow) : items.Count;
-
-        await using var conn = new NpgsqlConnection(_connectionString);
-        await conn.OpenAsync(cancellationToken);
-
-        for (var offset = 0; offset < items.Count; offset += maxRowsPerBatch)
+        await _retryPipeline.ExecuteAsync(async (ct) =>
         {
-            var batchSlice = items.Skip(offset).Take(maxRowsPerBatch).ToList();
+            var propertiesToInsert = indexDescriptor.ProjectionDocumentSchema.Properties;
+            var propertyNames = propertiesToInsert.Select(p => p.PropertyName).ToArray();
+            var keyColumnName = indexDescriptor.ProjectionDocumentSchema.KeyColumnName;
 
-            var sb = new StringBuilder();
-            sb.Append($"INSERT INTO \"{indexDescriptor.IndexName}\" ({string.Join(',', propertyNames)}) VALUES ");
+            // PostgreSQL max parameters ~65535; sub-batch to stay within limits
+            var maxParamsPerRow = propertyNames.Length;
+            var maxRowsPerBatch = maxParamsPerRow > 0 ? Math.Max(1, 65000 / maxParamsPerRow) : items.Count;
 
-            var allParams = new List<NpgsqlParameter>();
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(ct);
 
-            for (var rowIdx = 0; rowIdx < batchSlice.Count; rowIdx++)
+            for (var offset = 0; offset < items.Count; offset += maxRowsPerBatch)
             {
-                var item = batchSlice[rowIdx];
-                var doc = item.Document;
-                doc[nameof(ProjectionDocument.PartitionKey)] = item.PartitionKey;
-                doc[nameof(ProjectionDocument.UpdatedAt)] = item.UpdatedAt;
+                var batchSlice = items.Skip(offset).Take(maxRowsPerBatch).ToList();
 
-                if (rowIdx > 0) sb.Append(',');
-                sb.Append('(');
+                var sb = new StringBuilder();
+                sb.Append($"INSERT INTO \"{indexDescriptor.IndexName}\" ({string.Join(',', propertyNames)}) VALUES ");
 
-                for (var colIdx = 0; colIdx < propertiesToInsert.Count; colIdx++)
+                var allParams = new List<NpgsqlParameter>();
+
+                for (var rowIdx = 0; rowIdx < batchSlice.Count; rowIdx++)
                 {
-                    var prop = propertiesToInsert[colIdx];
-                    var paramName = $"{prop.PropertyName}_{rowIdx}";
+                    var item = batchSlice[rowIdx];
+                    var doc = item.Document;
+                    doc[nameof(ProjectionDocument.PartitionKey)] = item.PartitionKey;
+                    doc[nameof(ProjectionDocument.UpdatedAt)] = item.UpdatedAt;
 
-                    if (colIdx > 0) sb.Append(',');
-                    sb.Append($"@{paramName}");
+                    if (rowIdx > 0) sb.Append(',');
+                    sb.Append('(');
 
-                    var value = doc.TryGetValue(prop.PropertyName, out var v) ? v : null;
-
-                    if (prop.IsNestedObject || prop.IsNestedArray)
+                    for (var colIdx = 0; colIdx < propertiesToInsert.Count; colIdx++)
                     {
-                        value = JsonSerializer.SerializeToDocument(value);
+                        var prop = propertiesToInsert[colIdx];
+                        var paramName = $"{prop.PropertyName}_{rowIdx}";
+
+                        if (colIdx > 0) sb.Append(',');
+                        sb.Append($"@{paramName}");
+
+                        var value = doc.TryGetValue(prop.PropertyName, out var v) ? v : null;
+
+                        if (prop.IsNestedObject || prop.IsNestedArray)
+                        {
+                            value = JsonSerializer.SerializeToDocument(value);
+                        }
+
+                        allParams.Add(new NpgsqlParameter(paramName, value ?? DBNull.Value));
                     }
 
-                    allParams.Add(new NpgsqlParameter(paramName, value ?? DBNull.Value));
+                    sb.Append(')');
                 }
 
-                sb.Append(')');
-            }
+                sb.Append($" ON CONFLICT ({keyColumnName}) DO UPDATE SET ");
+                sb.Append(string.Join(',', propertyNames.Select(p => $"{p} = EXCLUDED.{p}")));
 
-            sb.Append($" ON CONFLICT ({keyColumnName}) DO UPDATE SET ");
-            sb.Append(string.Join(',', propertyNames.Select(p => $"{p} = EXCLUDED.{p}")));
+                await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
+                cmd.Parameters.AddRange(allParams.ToArray());
 
-            await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
-            cmd.Parameters.AddRange(allParams.ToArray());
-
-            try
-            {
-                await cmd.ExecuteNonQueryAsync(cancellationToken);
-            }
-            catch (NpgsqlException ex)
-            {
-                if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+                try
                 {
-                    throw new InvalidProjectionSchemaException(ex);
+                    await cmd.ExecuteNonQueryAsync(ct);
                 }
+                catch (NpgsqlException ex)
+                {
+                    if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+                    {
+                        throw new InvalidProjectionSchemaException(ex);
+                    }
 
-                throw new Exception(
-                    $"FlushBufferAsync failed on \"{indexDescriptor.IndexName}\" (batch of {batchSlice.Count} rows).",
-                    ex
-                );
+                    throw new Exception(
+                        $"FlushBufferAsync failed on \"{indexDescriptor.IndexName}\" (batch of {batchSlice.Count} rows).",
+                        ex
+                    );
+                }
             }
-        }
+        }, cancellationToken);
     }
 
     protected override async Task<ProjectionQueryResult<Dictionary<string, object?>>> QueryInternal(
@@ -586,17 +637,13 @@ public class PostgresqlProjectionRepository : ProjectionRepository
 
         var queryChunk = ConstructConditionFilters(projectionQuery.Filters, indexDescriptor.ProjectionDocumentSchema);
 
-        // need to wrap whole filters where statement in brackets for all other ANDs to work properly
-        // see partitionKey and search statements below
-        //queryChunk.WhereChunk = $"({queryChunk.WhereChunk})";
-        
         var fromStatements = new List<string>()
         {
             "\"" + indexDescriptor.IndexName + "\""
         };
-        
+
         fromStatements.AddRange(queryChunk.AdditionalFromSelects);
-        
+
         var sb = new StringBuilder();
         sb.Append("SELECT ");
         sb.AppendJoin(',', properties.Select(p => p.PropertyName));
@@ -626,16 +673,16 @@ public class PostgresqlProjectionRepository : ProjectionRepository
 
         sb.Append(" GROUP BY id");
 
-        // total count query — use COUNT(DISTINCT id) to avoid inflated counts from jsonb_array_elements joins
+        // total count query -- use COUNT(DISTINCT id) to avoid inflated counts from jsonb_array_elements joins
         string totalCountQuery = $"SELECT COUNT(DISTINCT id) FROM {string.Join(", ", fromStatements)}";
         if (!string.IsNullOrEmpty(queryChunk.WhereChunk))
         {
             totalCountQuery += $" WHERE {queryChunk.WhereChunk}";
         }
-        
+
         NpgsqlParameter[] totalCountParams = new NpgsqlParameter[queryChunk.Parameters.Count];
         queryChunk.Parameters.CopyTo(totalCountParams);
-        
+
         if (projectionQuery.OrderBy.Count > 0)
         {
             var orderByClauses = new List<string>();
@@ -715,131 +762,134 @@ public class PostgresqlProjectionRepository : ProjectionRepository
             sb.Append(" ORDER BY ");
             sb.Append(string.Join(',', orderByClauses));
         }
-        
+
         if (projectionQuery.Limit.HasValue)
         {
             sb.Append(" LIMIT @limit");
             queryChunk.Parameters.Add(new NpgsqlParameter("limit", projectionQuery.Limit.Value));
         }
-        
+
         sb.Append(" OFFSET @offset");
         queryChunk.Parameters.Add(new NpgsqlParameter("offset", projectionQuery.Offset));
 
-        await using var conn = new NpgsqlConnection(_connectionString);
-        await conn.OpenAsync(cancellationToken);
-        
-        try
+        return await _retryPipeline.ExecuteAsync(async (ct) =>
         {
-            // calculate total count
-            await using var totalCountCmd = new NpgsqlCommand(totalCountQuery, conn);
-            totalCountCmd.Parameters.AddRange(totalCountParams);
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(ct);
 
-            var totalCount = await totalCountCmd.ExecuteScalarAsync(cancellationToken) as long?;
-            totalCountCmd.Parameters.Clear();
-
-            var commandText = sb.ToString();
-            
-            Logger.LogTrace("Executing command: {CommandText} with parameters: {Parameters}", 
-                commandText, 
-                string.Join(", ", queryChunk.Parameters.Select(p => $"{p.ParameterName} = {p.Value}"))
-            );
-            
-            await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
-            cmd.Parameters.AddRange(queryChunk.Parameters.ToArray());
-
-            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
-
-            var records = new List<Dictionary<string, object?>>();
-            while (await reader.ReadAsync(cancellationToken))
+            try
             {
-                var document = new Dictionary<string, object?>();
+                // calculate total count
+                await using var totalCountCmd = new NpgsqlCommand(totalCountQuery, conn);
+                totalCountCmd.Parameters.AddRange(totalCountParams.Select(p => p.Clone()).ToArray());
 
-                var values = new object[properties.Count];
-                reader.GetValues(values);
+                var totalCount = await totalCountCmd.ExecuteScalarAsync(ct) as long?;
+                totalCountCmd.Parameters.Clear();
 
-                if (values.Length <= 0)
-                {
-                    continue;
-                }
+                var commandText = sb.ToString();
 
-                for (var i = 0; i < properties.Count; i++)
-                {
-                    if (values[i] is DBNull)
-                    {
-                        document[indexDescriptor.ProjectionDocumentSchema.Properties[i].PropertyName] = null;
-                    }
-                    // try to check whether the property is a json object or array
-                    else if (
-                        (indexDescriptor.ProjectionDocumentSchema.Properties[i].IsNestedObject || indexDescriptor.ProjectionDocumentSchema.Properties[i].IsNestedArray) 
-                        && values[i] is string
-                    )
-                    {
-                        document[properties[i].PropertyName] = JsonToObjectConverter.Convert((string)values[i], properties[i]);
-                    }
-                    else
-                    {
-                        document[properties[i].PropertyName] = values[i];
-                    }
-                }
-
-                records.Add(document);
-            }
-
-            var debugInformation = "";
-
-            if (_includeDebugInformation)
-            {
-                debugInformation += cmd.CommandText;
-                
-                foreach (NpgsqlParameter param in cmd.Parameters)
-                {
-                    var paramValue = "";
-
-                    switch (param.NpgsqlDbType)
-                    {
-                        case NpgsqlDbType.Uuid:
-                        case NpgsqlDbType.Text:
-                            paramValue = $"'{param.NpgsqlValue}'";
-                            break;
-                        default: 
-                            paramValue = param.NpgsqlValue?.ToString();
-                            break;
-                    }
-
-                    debugInformation = debugInformation.Replace($"@{param.ParameterName}", paramValue);
-                }
-                
-                debugInformation += $"\n\nOriginal command:\n{cmd.CommandText}; " +
-                    $"{string.Join(',', cmd.Parameters.Select(p => $"@{p.ParameterName}:{p.NpgsqlDbType}={p.NpgsqlValue}"))}";
-            }
-
-            return new ProjectionQueryResult<Dictionary<string, object?>>
-            {
-                DebugInformation = _includeDebugInformation ? debugInformation : String.Empty, 
-                IndexName = TableName,
-                TotalRecordsFound = totalCount,
-                Records = records.Select(x =>
-                    new QueryResultDocument<Dictionary<string, object?>>
-                    {
-                        Document = x
-                    }
-                ).ToList()
-            };
-        }
-        catch (NpgsqlException ex)
-        {
-            if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
-            {
-                throw new InvalidProjectionSchemaException(ex);
-            }
-            else 
-            {
-                throw new Exception(
-                    $"Something went terribly wrong while querying \"{TableName}\".",
-                    ex
+                Logger.LogTrace("Executing command: {CommandText} with parameters: {Parameters}",
+                    commandText,
+                    string.Join(", ", queryChunk.Parameters.Select(p => $"{p.ParameterName} = {p.Value}"))
                 );
+
+                await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
+                cmd.Parameters.AddRange(queryChunk.Parameters.Select(p => p.Clone()).ToArray());
+
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+                var records = new List<Dictionary<string, object?>>();
+                while (await reader.ReadAsync(ct))
+                {
+                    var document = new Dictionary<string, object?>();
+
+                    var values = new object[properties.Count];
+                    reader.GetValues(values);
+
+                    if (values.Length <= 0)
+                    {
+                        continue;
+                    }
+
+                    for (var i = 0; i < properties.Count; i++)
+                    {
+                        if (values[i] is DBNull)
+                        {
+                            document[indexDescriptor.ProjectionDocumentSchema.Properties[i].PropertyName] = null;
+                        }
+                        // try to check whether the property is a json object or array
+                        else if (
+                            (indexDescriptor.ProjectionDocumentSchema.Properties[i].IsNestedObject || indexDescriptor.ProjectionDocumentSchema.Properties[i].IsNestedArray)
+                            && values[i] is string
+                        )
+                        {
+                            document[properties[i].PropertyName] = JsonToObjectConverter.Convert((string)values[i], properties[i]);
+                        }
+                        else
+                        {
+                            document[properties[i].PropertyName] = values[i];
+                        }
+                    }
+
+                    records.Add(document);
+                }
+
+                var debugInformation = "";
+
+                if (_includeDebugInformation)
+                {
+                    debugInformation += cmd.CommandText;
+
+                    foreach (NpgsqlParameter param in cmd.Parameters)
+                    {
+                        var paramValue = "";
+
+                        switch (param.NpgsqlDbType)
+                        {
+                            case NpgsqlDbType.Uuid:
+                            case NpgsqlDbType.Text:
+                                paramValue = $"'{param.NpgsqlValue}'";
+                                break;
+                            default:
+                                paramValue = param.NpgsqlValue?.ToString();
+                                break;
+                        }
+
+                        debugInformation = debugInformation.Replace($"@{param.ParameterName}", paramValue);
+                    }
+
+                    debugInformation += $"\n\nOriginal command:\n{cmd.CommandText}; " +
+                        $"{string.Join(',', cmd.Parameters.Select(p => $"@{p.ParameterName}:{p.NpgsqlDbType}={p.NpgsqlValue}"))}";
+                }
+
+                return new ProjectionQueryResult<Dictionary<string, object?>>
+                {
+                    DebugInformation = _includeDebugInformation ? debugInformation : String.Empty,
+                    IndexName = TableName,
+                    TotalRecordsFound = totalCount,
+                    Records = records.Select(x =>
+                        new QueryResultDocument<Dictionary<string, object?>>
+                        {
+                            Document = x
+                        }
+                    ).ToList()
+                };
             }
-        }
+            catch (NpgsqlException ex)
+            {
+                if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+                {
+                    throw new InvalidProjectionSchemaException(ex);
+                }
+                else
+                {
+                    throw new Exception(
+                        $"Something went terribly wrong while querying \"{TableName}\".",
+                        ex
+                    );
+                }
+            }
+        }, cancellationToken);
     }
     
     protected override async Task<long> UpdateByQueryInternal(
@@ -899,29 +949,32 @@ public class PostgresqlProjectionRepository : ProjectionRepository
             sb.Append(queryChunk.WhereChunk);
         }
 
-        await using var conn = new NpgsqlConnection(_connectionString);
-        await conn.OpenAsync(cancellationToken);
-
-        try
+        return await _retryPipeline.ExecuteAsync(async (ct) =>
         {
-            await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
-            cmd.Parameters.AddRange(queryChunk.Parameters.ToArray());
-            cmd.Parameters.AddRange(setParameters.ToArray());
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(ct);
 
-            return await cmd.ExecuteNonQueryAsync(cancellationToken);
-        }
-        catch (NpgsqlException ex)
-        {
-            if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+            try
             {
-                throw new InvalidProjectionSchemaException(ex);
-            }
+                await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
+                cmd.Parameters.AddRange(queryChunk.Parameters.Select(p => p.Clone()).ToArray());
+                cmd.Parameters.AddRange(setParameters.Select(p => p.Clone()).ToArray());
 
-            throw new Exception(
-                $"Something went terribly wrong while executing UpdateByQuery on \"{indexDescriptor.IndexName}\".",
-                ex
-            );
-        }
+                return (long)await cmd.ExecuteNonQueryAsync(ct);
+            }
+            catch (NpgsqlException ex)
+            {
+                if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+                {
+                    throw new InvalidProjectionSchemaException(ex);
+                }
+
+                throw new Exception(
+                    $"Something went terribly wrong while executing UpdateByQuery on \"{indexDescriptor.IndexName}\".",
+                    ex
+                );
+            }
+        }, cancellationToken);
     }
 
     private QueryChunk ConstructOneConditionFilter(Filter filter, ProjectionDocumentSchema schema)

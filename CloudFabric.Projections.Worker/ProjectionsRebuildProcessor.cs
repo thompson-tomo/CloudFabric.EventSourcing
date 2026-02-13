@@ -9,6 +9,8 @@ public class ProjectionsRebuildProcessor
     private readonly Func<string, Task<IProjectionsEngine>> _projectionsEngineFactory;
     private readonly ProjectionRepositoryFactory? _repositoryFactory;
     private readonly IMetadataRepository? _metadataRepository;
+    private readonly IDistributedLock? _distributedLock;
+    private readonly TimeSpan _rebuildHealthCheckTimeout;
 
     private readonly ILogger<ProjectionsRebuildProcessor> _logger;
 
@@ -17,13 +19,17 @@ public class ProjectionsRebuildProcessor
         Func<string, Task<IProjectionsEngine>> projectionsEngineFactory,
         ILogger<ProjectionsRebuildProcessor> logger,
         ProjectionRepositoryFactory? repositoryFactory = null,
-        IMetadataRepository? metadataRepository = null
+        IMetadataRepository? metadataRepository = null,
+        IDistributedLock? distributedLock = null,
+        TimeSpan? rebuildHealthCheckTimeout = null
     ) {
         _projectionRepository = projectionRepository;
         _projectionsEngineFactory = projectionsEngineFactory;
         _logger = logger;
         _repositoryFactory = repositoryFactory;
         _metadataRepository = metadataRepository;
+        _distributedLock = distributedLock;
+        _rebuildHealthCheckTimeout = rebuildHealthCheckTimeout ?? TimeSpan.FromMinutes(5);
     }
 
     public async Task RebuildProjectionsThatRequireRebuild(
@@ -41,14 +47,36 @@ public class ProjectionsRebuildProcessor
             {
                 try
                 {
-                    var (projectionIndexState, indexNameToRebuild) = await _projectionRepository.AcquireAndLockProjectionThatRequiresRebuild();
+                    var (projectionIndexState, indexNameToRebuild) =
+                        await _projectionRepository.AcquireAndLockProjectionThatRequiresRebuild(_rebuildHealthCheckTimeout);
 
                     if (projectionIndexState == null || indexNameToRebuild == null)
                     {
                         break;
                     }
 
-                    tasks.Add(RebuildOneProjectionWhichRequiresRebuild(projectionIndexState, indexNameToRebuild, cancellationToken));
+                    // If distributed lock is available, try to acquire it for exclusive rebuild access
+                    if (_distributedLock != null)
+                    {
+                        var lockHandle = await _distributedLock.TryAcquireAsync(
+                            $"rebuild:{indexNameToRebuild}", cancellationToken);
+
+                        if (lockHandle == null)
+                        {
+                            _logger.LogInformation(
+                                "Projection rebuild for {IndexName} is already in progress on another instance, skipping",
+                                indexNameToRebuild);
+                            continue;
+                        }
+
+                        tasks.Add(RebuildWithLockAsync(
+                            projectionIndexState, indexNameToRebuild, lockHandle, cancellationToken));
+                    }
+                    else
+                    {
+                        tasks.Add(RebuildOneProjectionWhichRequiresRebuild(
+                            projectionIndexState, indexNameToRebuild, cancellationToken));
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -75,6 +103,23 @@ public class ProjectionsRebuildProcessor
                 _logger.LogWarning("All rebuild tasks failed, stopping retry loop");
                 return;
             }
+        }
+    }
+
+    private async Task<bool> RebuildWithLockAsync(
+        ProjectionIndexState projectionIndexState,
+        string indexNameToRebuild,
+        IAsyncDisposable lockHandle,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await RebuildOneProjectionWhichRequiresRebuild(
+                projectionIndexState, indexNameToRebuild, cancellationToken);
+        }
+        finally
+        {
+            await lockHandle.DisposeAsync();
         }
     }
 
