@@ -1,4 +1,5 @@
 using System.Text;
+using CloudFabric.EventSourcing.AspNet;
 using CloudFabric.EventSourcing.AspNet.Postgresql.Extensions;
 using CloudFabric.EventSourcing.Domain;
 using CloudFabric.EventSourcing.EventStore;
@@ -51,7 +52,8 @@ builder.Services.Configure<UserAccessTokensServiceOptions>(builder.Configuration
 
 #region User Accounts Projections
 
-builder.Services.AddPostgresqlEventStore(builder.Configuration.GetConnectionString("Default"), "todolist-events", "todolist-metadata")
+var eventSourcingBuilder = builder.Services
+    .AddPostgresqlEventStore(builder.Configuration.GetConnectionString("Default"), "todolist-events", "todolist-metadata")
     .AddRepository<AggregateRepository<UserAccount>>()
     .AddRepository<AggregateRepository<UserAccountEmailAddress>>()
 
@@ -94,9 +96,7 @@ app.MapControllerRoute(
 );
 
 # region Database init
-var initScope = app.Services.CreateScope();
-var eventStore = initScope.ServiceProvider.GetRequiredService<IEventStore>();
-await eventStore.Initialize();
+await eventSourcingBuilder.InitializeEventStore(app.Services);
 #endregion
 
 app.Run();

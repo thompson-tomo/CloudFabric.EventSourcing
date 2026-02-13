@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using CloudFabric.EventSourcing.AspNet;
 using CloudFabric.EventSourcing.AspNet.Postgresql.Extensions;
 using CloudFabric.EventSourcing.Domain;
 using CloudFabric.EventSourcing.EventStore;

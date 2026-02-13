@@ -13,13 +13,13 @@ using Microsoft.Extensions.Options;
 
 namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
 {
-    class PostgresqlEventSourcingScope
+    internal class PostgresqlEventSourcingScope
     {
-        public IEventStore EventStore { get; set; }
-        public EventsObserver EventsObserver { get; set; }
-        public ProjectionsEngine? ProjectionsEngine { get; set; }
-        public IMetadataRepository MetadataRepository { get; set; }
-        public ISequenceGenerator SequenceGenerator { get; set; }
+        public required IEventStore EventStore { get; init; }
+        public required EventsObserver EventsObserver { get; init; }
+        public ProjectionsEngine? ProjectionsEngine { get; init; }
+        public required IMetadataRepository MetadataRepository { get; init; }
+        public required ISequenceGenerator SequenceGenerator { get; init; }
     }
 
     public static class ServiceCollectionExtensions
@@ -59,46 +59,34 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
                 eventStoreKey,
                 (sp, key) =>
                 {
-                    var scope = new PostgresqlEventSourcingScope();
-
                     var connectionInformationProvider = sp.GetRequiredKeyedService<IPostgresqlEventStoreConnectionInformationProvider>(eventStoreKey);
 
-                    scope.EventStore = new PostgresqlEventStore(connectionInformationProvider);
+                    var eventStore = new PostgresqlEventStore(connectionInformationProvider);
 
-                    scope.EventsObserver = new PostgresqlEventStoreEventObserver(
-                        (PostgresqlEventStore)scope.EventStore,
+                    var eventsObserver = new PostgresqlEventStoreEventObserver(
+                        eventStore,
                         sp.GetRequiredService<ILogger<PostgresqlEventStoreEventObserver>>()
                     );
 
+                    ProjectionsEngine? projectionsEngine = null;
                     var projectionsRepositoryFactory = sp.GetKeyedService<ProjectionRepositoryFactory>(eventStoreKey);
 
                     if (projectionsRepositoryFactory != null && builder.ProjectionBuilderFactories != null)
                     {
-                        var errorHandler = sp.GetService<IProjectionErrorHandler>();
-                        scope.ProjectionsEngine = new ProjectionsEngine(
-                            scope.EventsObserver,
-                            sp.GetRequiredService<ILogger<ProjectionsEngine>>(),
-                            errorHandler
+                        projectionsEngine = CreateProjectionsEngine(
+                            sp, eventsObserver, projectionsRepositoryFactory,
+                            builder.ProjectionBuilderFactories, ProjectionOperationIndexSelector.Write
                         );
-
-                        foreach (var factory in builder.ProjectionBuilderFactories)
-                        {
-                            var projectionBuilder = factory(
-                                sp,
-                                projectionsRepositoryFactory,
-                                ProjectionOperationIndexSelector.Write
-                            );
-
-                            scope.ProjectionsEngine.AddProjectionBuilder(projectionBuilder);
-                        }
-
-                        // No explicit StartAsync needed - Postgresql observer subscribes in constructor
                     }
 
-                    scope.MetadataRepository = new PostgresqlMetadataRepository(connectionInformationProvider);
-                    scope.SequenceGenerator = new PostgresqlSequenceGenerator(connectionInformationProvider);
-
-                    return scope;
+                    return new PostgresqlEventSourcingScope
+                    {
+                        EventStore = eventStore,
+                        EventsObserver = eventsObserver,
+                        ProjectionsEngine = projectionsEngine,
+                        MetadataRepository = new PostgresqlMetadataRepository(connectionInformationProvider),
+                        SequenceGenerator = new PostgresqlSequenceGenerator(connectionInformationProvider)
+                    };
                 }
             );
 
@@ -155,20 +143,6 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
             return builder;
         }
 
-        public static IEventSourcingBuilder AddRepository<TRepo>(this IEventSourcingBuilder builder)
-            where TRepo : class
-        {
-            builder.Services.AddScoped(
-                (sp) =>
-                {
-                    var eventStore = sp.GetRequiredKeyedService<IEventStore>(builder.EventStoreKey);
-                    return ActivatorUtilities.CreateInstance<TRepo>(sp, new object[] { eventStore });
-                }
-            );
-
-            return builder;
-        }
-
         public static IEventSourcingBuilder AddPostgresqlProjections(
             this IEventSourcingBuilder builder,
             string projectionsConnectionString,
@@ -177,7 +151,6 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
         )
         {
             var b = (EventSourcingBuilder)builder;
-            b.ProjectionsConnectionString = projectionsConnectionString;
             b.ProjectionBuilderFactories = projectionBuilderFactories;
 
             builder.Services.AddKeyedScoped<ProjectionRepositoryFactory>(
@@ -202,60 +175,23 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
         public static IEventSourcingBuilder AddProjectionsRebuildProcessor(this IEventSourcingBuilder builder)
         {
             var b = (EventSourcingBuilder)builder;
+            var eventStoreKey = builder.EventStoreKey;
 
-            // Register as IHostedService directly so the scope is owned by the hosted service
-            // and properly disposed on shutdown via IDisposable.
             builder.Services.AddSingleton<IHostedService>(
                 (sp) =>
                 {
                     var rebuildProcessorScope = sp.CreateScope();
-
-                    var distributedLock = rebuildProcessorScope.ServiceProvider.GetService<IDistributedLock>();
+                    var scopedProvider = rebuildProcessorScope.ServiceProvider;
 
                     var processor = new ProjectionsRebuildProcessor(
-                        rebuildProcessorScope.ServiceProvider.GetRequiredKeyedService<ProjectionRepositoryFactory>(builder.EventStoreKey)
+                        scopedProvider.GetRequiredKeyedService<ProjectionRepositoryFactory>(eventStoreKey)
                             .GetProjectionsIndexStateRepository(),
-                        async (string connectionId) =>
-                        {
-                            var connectionInformationProvider = rebuildProcessorScope.ServiceProvider
-                                .GetRequiredKeyedService<IPostgresqlEventStoreConnectionInformationProvider>(builder.EventStoreKey);
-
-                            var connectionInformation = connectionInformationProvider.GetConnectionInformation(connectionId);
-                            var eventStore = new PostgresqlEventStore(
-                                connectionInformation.ConnectionString, connectionInformation.TableName, connectionInformation.MetadataTableName
-                            );
-
-                            var eventObserver = new PostgresqlEventStoreEventObserver(
-                                (PostgresqlEventStore)eventStore,
-                                rebuildProcessorScope.ServiceProvider.GetRequiredService<ILogger<PostgresqlEventStoreEventObserver>>()
-                            );
-
-                            var rebuildErrorHandler = rebuildProcessorScope.ServiceProvider.GetService<IProjectionErrorHandler>();
-                            var projectionsEngine = new ProjectionsEngine(
-                                eventObserver,
-                                rebuildProcessorScope.ServiceProvider.GetRequiredService<ILogger<ProjectionsEngine>>(),
-                                rebuildErrorHandler
-                            );
-
-                            if (b.ProjectionBuilderFactories != null)
-                            {
-                                foreach (var factory in b.ProjectionBuilderFactories)
-                                {
-                                    var projectionBuilder = factory(
-                                        rebuildProcessorScope.ServiceProvider,
-                                        rebuildProcessorScope.ServiceProvider.GetRequiredKeyedService<ProjectionRepositoryFactory>(builder.EventStoreKey),
-                                        ProjectionOperationIndexSelector.ProjectionRebuild
-                                    );
-
-                                    projectionsEngine.AddProjectionBuilder(projectionBuilder);
-                                }
-                            }
-
-                            return projectionsEngine;
-                        },
-                        rebuildProcessorScope.ServiceProvider.GetRequiredService<ILogger<ProjectionsRebuildProcessor>>(),
-                        metadataRepository: rebuildProcessorScope.ServiceProvider.GetRequiredKeyedService<IMetadataRepository>(builder.EventStoreKey),
-                        distributedLock: distributedLock
+                        connectionId => CreateProjectionsEngineForRebuild(
+                            connectionId, scopedProvider, eventStoreKey, b.ProjectionBuilderFactories
+                        ),
+                        scopedProvider.GetRequiredService<ILogger<ProjectionsRebuildProcessor>>(),
+                        metadataRepository: scopedProvider.GetRequiredKeyedService<IMetadataRepository>(eventStoreKey),
+                        distributedLock: scopedProvider.GetService<IDistributedLock>()
                     );
 
                     var options = sp.GetRequiredService<IOptions<ProjectionsRebuildProcessorOptions>>();
@@ -268,6 +204,68 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
             );
 
             return builder;
+        }
+
+        private static ProjectionsEngine CreateProjectionsEngine(
+            IServiceProvider serviceProvider,
+            EventsObserver eventsObserver,
+            ProjectionRepositoryFactory repositoryFactory,
+            ProjectionBuilderFactory[] projectionBuilderFactories,
+            ProjectionOperationIndexSelector indexSelector)
+        {
+            var errorHandler = serviceProvider.GetService<IProjectionErrorHandler>();
+            var engine = new ProjectionsEngine(
+                eventsObserver,
+                serviceProvider.GetRequiredService<ILogger<ProjectionsEngine>>(),
+                errorHandler
+            );
+
+            foreach (var factory in projectionBuilderFactories)
+            {
+                engine.AddProjectionBuilder(factory(serviceProvider, repositoryFactory, indexSelector));
+            }
+
+            return engine;
+        }
+
+        private static Task<IProjectionsEngine> CreateProjectionsEngineForRebuild(
+            string connectionId,
+            IServiceProvider serviceProvider,
+            string eventStoreKey,
+            ProjectionBuilderFactory[]? projectionBuilderFactories)
+        {
+            var connectionInformationProvider = serviceProvider
+                .GetRequiredKeyedService<IPostgresqlEventStoreConnectionInformationProvider>(eventStoreKey);
+
+            var connectionInformation = connectionInformationProvider.GetConnectionInformation(connectionId);
+            var eventStore = new PostgresqlEventStore(
+                connectionInformation.ConnectionString,
+                connectionInformation.TableName,
+                connectionInformation.MetadataTableName
+            );
+
+            var eventsObserver = new PostgresqlEventStoreEventObserver(
+                eventStore,
+                serviceProvider.GetRequiredService<ILogger<PostgresqlEventStoreEventObserver>>()
+            );
+
+            var repositoryFactory = serviceProvider
+                .GetRequiredKeyedService<ProjectionRepositoryFactory>(eventStoreKey);
+
+            ProjectionsEngine engine;
+            if (projectionBuilderFactories != null)
+            {
+                engine = CreateProjectionsEngine(
+                    serviceProvider, eventsObserver, repositoryFactory,
+                    projectionBuilderFactories, ProjectionOperationIndexSelector.ProjectionRebuild
+                );
+            }
+            else
+            {
+                engine = new ProjectionsEngine(eventsObserver);
+            }
+
+            return Task.FromResult<IProjectionsEngine>(engine);
         }
 
         /// <summary>

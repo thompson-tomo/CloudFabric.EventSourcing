@@ -14,6 +14,7 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
     {
         public static IEventSourcingBuilder AddCosmosDbEventStore(
             this IServiceCollection services,
+            string eventStoreKey,
             string connectionString,
             CosmosClientOptions cosmosClientOptions,
             string databaseId,
@@ -25,17 +26,24 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
             string processorName
         )
         {
+            var builder = new EventSourcingBuilder
+            {
+                EventStoreKey = eventStoreKey,
+                Services = services
+            };
+
             // CosmosClient is thread-safe and should be shared
             var cosmosClient = new CosmosClient(connectionString, cosmosClientOptions);
             var eventStore = new CosmosDbEventStore(cosmosClient, databaseId, eventsContainerId);
 
-            services.AddScoped<AggregateRepositoryFactory>(_ => new AggregateRepositoryFactory(eventStore));
+            services.AddKeyedSingleton<IEventStore>(eventStoreKey, (_, _) => eventStore);
+            services.AddKeyedScoped<AggregateRepositoryFactory>(eventStoreKey, (_, _) => new AggregateRepositoryFactory(eventStore));
 
             var metadataRepository = new CosmosDbMetadataRepository(connectionString, cosmosClientOptions, databaseId, itemsContainerId);
-            services.AddScoped<IMetadataRepository>(_ => metadataRepository);
+            services.AddKeyedSingleton<IMetadataRepository>(eventStoreKey, (_, _) => metadataRepository);
 
             var sequenceGenerator = new CosmosDbSequenceGenerator(cosmosClient, databaseId, itemsContainerId);
-            services.AddScoped<ISequenceGenerator>(_ => sequenceGenerator);
+            services.AddKeyedSingleton<ISequenceGenerator>(eventStoreKey, (_, _) => sequenceGenerator);
 
             // Register change feed observer as singleton (background process)
             services.AddSingleton<CosmosDbEventStoreChangeFeedObserver>(sp =>
@@ -53,15 +61,18 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
                 );
             });
 
-            return new EventSourcingBuilder
-            {
-                EventStore = eventStore,
-                Services = services
-            };
+            // Register the change feed observer as keyed EventsObserver too
+            services.AddKeyedSingleton<EventsObserver>(
+                eventStoreKey,
+                (sp, _) => sp.GetRequiredService<CosmosDbEventStoreChangeFeedObserver>()
+            );
+
+            return builder;
         }
 
         public static IEventSourcingBuilder AddCosmosDbEventStore(
             this IServiceCollection services,
+            string eventStoreKey,
             CosmosClient client,
             string databaseId,
             string eventsContainerId
@@ -69,24 +80,15 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
         {
             var eventStore = new CosmosDbEventStore(client, databaseId, eventsContainerId);
 
-            return new EventSourcingBuilder
+            var builder = new EventSourcingBuilder
             {
-                EventStore = eventStore,
+                EventStoreKey = eventStoreKey,
                 Services = services
             };
-        }
 
-        public static IEventSourcingBuilder AddRepository<TRepo>(this IEventSourcingBuilder builder)
-            where TRepo : class
-        {
-            var b = (EventSourcingBuilder)builder;
+            services.AddKeyedSingleton<IEventStore>(eventStoreKey, (_, _) => eventStore);
+            services.AddKeyedScoped<AggregateRepositoryFactory>(eventStoreKey, (_, _) => new AggregateRepositoryFactory(eventStore));
 
-            if (b.EventStore == null)
-            {
-                throw new ArgumentException("Event store is missing");
-            }
-
-            builder.Services.AddSingleton(sp => ActivatorUtilities.CreateInstance<TRepo>(sp, new object[] { b.EventStore }));
             return builder;
         }
 
@@ -108,12 +110,22 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
                 projectionsConnectionInfo.ContainerId
             );
 
-            builder.Services.AddScoped<ProjectionRepositoryFactory>(_ => projectionsRepositoryFactory);
+            builder.Services.AddKeyedScoped<ProjectionRepositoryFactory>(
+                builder.EventStoreKey, (_, _) => projectionsRepositoryFactory
+            );
 
             // CosmosDb uses change feed which is a global background process,
             // so ProjectionsEngine is singleton (unlike PostgreSQL's per-request pattern).
+            // A dedicated scope is created so that projection builder factories can resolve
+            // scoped services (e.g. AggregateRepositoryFactory). The scope lives as long as
+            // the singleton engine and is disposed when the hosted service shuts down.
+            IServiceScope? projectionsScope = null;
+
             builder.Services.AddSingleton<ProjectionsEngine>(sp =>
             {
+                projectionsScope = sp.CreateScope();
+                var scopedProvider = projectionsScope.ServiceProvider;
+
                 var changeFeedObserver = sp.GetRequiredService<CosmosDbEventStoreChangeFeedObserver>();
                 var errorHandler = sp.GetService<IProjectionErrorHandler>();
                 var projectionsEngine = new ProjectionsEngine(
@@ -125,7 +137,7 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
                 foreach (var factory in projectionBuilderFactories)
                 {
                     var projectionBuilder = factory(
-                        sp,
+                        scopedProvider,
                         projectionsRepositoryFactory,
                         ProjectionOperationIndexSelector.Write
                     );
@@ -140,7 +152,7 @@ namespace CloudFabric.EventSourcing.AspNet.CosmosDb.Extensions
             builder.Services.AddSingleton<IHostedService>(sp =>
             {
                 var engine = sp.GetRequiredService<ProjectionsEngine>();
-                return new CosmosDbProjectionsHostedService(engine);
+                return new CosmosDbProjectionsHostedService(engine, onDispose: () => projectionsScope?.Dispose());
             });
 
             return builder;

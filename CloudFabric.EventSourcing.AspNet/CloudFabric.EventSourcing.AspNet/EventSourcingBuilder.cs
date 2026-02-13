@@ -9,9 +9,6 @@ public class EventSourcingBuilder : IEventSourcingBuilder
     public string EventStoreKey { get; set; } = "";
     public required IServiceCollection Services { get; set; }
 
-    // Internal state used by ASP.NET extension methods
-    public IEventStore? EventStore { get; set; }
-    public string? ProjectionsConnectionString { get; set; }
     public ProjectionBuilderFactory[]? ProjectionBuilderFactories { get; set; }
 
     public async Task InitializeEventStore(IServiceProvider serviceProvider)

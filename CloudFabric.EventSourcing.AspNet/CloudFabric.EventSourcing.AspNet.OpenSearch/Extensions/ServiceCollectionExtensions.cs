@@ -18,8 +18,9 @@ namespace CloudFabric.EventSourcing.AspNet.OpenSearch.Extensions
             var b = (EventSourcingBuilder)builder;
             b.ProjectionBuilderFactories = projectionBuilderFactories;
 
-            builder.Services.AddScoped<ProjectionRepositoryFactory>(
-                (sp) => new OpenSearchProjectionRepositoryFactory(
+            builder.Services.AddKeyedScoped<ProjectionRepositoryFactory>(
+                builder.EventStoreKey,
+                (sp, key) => new OpenSearchProjectionRepositoryFactory(
                     basicAuthConnectionSettings,
                     loggerFactory,
                     disableRequestStreaming
@@ -40,8 +41,9 @@ namespace CloudFabric.EventSourcing.AspNet.OpenSearch.Extensions
             var b = (EventSourcingBuilder)builder;
             b.ProjectionBuilderFactories = projectionBuilderFactories;
 
-            builder.Services.AddScoped<ProjectionRepositoryFactory>(
-                (sp) => new OpenSearchProjectionRepositoryFactory(
+            builder.Services.AddKeyedScoped<ProjectionRepositoryFactory>(
+                builder.EventStoreKey,
+                (sp, key) => new OpenSearchProjectionRepositoryFactory(
                     awsAuthConnectionSettings,
                     loggerFactory,
                     disableRequestStreaming

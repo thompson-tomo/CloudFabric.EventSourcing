@@ -18,8 +18,9 @@ namespace CloudFabric.EventSourcing.AspNet.ElasticSearch.Extensions
             var b = (EventSourcingBuilder)builder;
             b.ProjectionBuilderFactories = projectionBuilderFactories;
 
-            builder.Services.AddScoped<ProjectionRepositoryFactory>(
-                (sp) => new ElasticSearchProjectionRepositoryFactory(
+            builder.Services.AddKeyedScoped<ProjectionRepositoryFactory>(
+                builder.EventStoreKey,
+                (sp, key) => new ElasticSearchProjectionRepositoryFactory(
                     basicAuthConnectionSettings,
                     loggerFactory,
                     disableRequestStreaming
@@ -40,8 +41,9 @@ namespace CloudFabric.EventSourcing.AspNet.ElasticSearch.Extensions
             var b = (EventSourcingBuilder)builder;
             b.ProjectionBuilderFactories = projectionBuilderFactories;
 
-            builder.Services.AddScoped<ProjectionRepositoryFactory>(
-                (sp) => new ElasticSearchProjectionRepositoryFactory(
+            builder.Services.AddKeyedScoped<ProjectionRepositoryFactory>(
+                builder.EventStoreKey,
+                (sp, key) => new ElasticSearchProjectionRepositoryFactory(
                     apiKeyAuthConnectionSettings,
                     loggerFactory,
                     disableRequestStreaming

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using CloudFabric.EventSourcing.Domain;
 using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.EventStore.InMemory;
 using CloudFabric.Projections;
@@ -9,84 +10,111 @@ using IMetadataRepository = CloudFabric.EventSourcing.EventStore.IMetadataReposi
 
 namespace CloudFabric.EventSourcing.AspNet.InMemory.Extensions
 {
+    internal class InMemoryEventSourcingScope
+    {
+        public required IEventStore EventStore { get; init; }
+        public required EventsObserver EventsObserver { get; init; }
+        public ProjectionsEngine? ProjectionsEngine { get; init; }
+        public required IMetadataRepository MetadataRepository { get; init; }
+        public required ISequenceGenerator SequenceGenerator { get; init; }
+    }
+
     public static class ServiceCollectionExtensions
     {
         public static IEventSourcingBuilder AddInMemoryEventStore(
             this IServiceCollection services,
+            string eventStoreKey,
             ConcurrentDictionary<(Guid, string), List<string>> eventsContainer,
             Dictionary<(string, string), string> itemsContainer
         )
         {
             var builder = new EventSourcingBuilder
             {
+                EventStoreKey = eventStoreKey,
                 Services = services
             };
 
-            services.AddScoped<IEventStore>(
-                (sp) =>
+            services.AddKeyedScoped<InMemoryEventSourcingScope>(
+                eventStoreKey,
+                (sp, key) =>
                 {
                     var eventStore = new InMemoryEventStore(eventsContainer);
 
-                    // add events observer for projections
-                    var eventStoreObserver = new InMemoryEventStoreEventObserver(
+                    var eventsObserver = new InMemoryEventStoreEventObserver(
                         eventStore, sp.GetRequiredService<ILogger<InMemoryEventStoreEventObserver>>()
                     );
 
-                    var projectionsRepositoryFactory = sp.GetService<ProjectionRepositoryFactory>();
+                    ProjectionsEngine? projectionsEngine = null;
+                    var projectionsRepositoryFactory = sp.GetKeyedService<ProjectionRepositoryFactory>(eventStoreKey);
 
                     if (projectionsRepositoryFactory != null && builder.ProjectionBuilderFactories != null)
                     {
                         var errorHandler = sp.GetService<IProjectionErrorHandler>();
-                        var projectionsEngine = new ProjectionsEngine(
-                            eventStoreObserver,
+                        projectionsEngine = new ProjectionsEngine(
+                            eventsObserver,
                             sp.GetRequiredService<ILogger<ProjectionsEngine>>(),
                             errorHandler
                         );
 
                         foreach (var factory in builder.ProjectionBuilderFactories)
                         {
-                            var projectionBuilder = factory(
-                                sp,
-                                projectionsRepositoryFactory,
-                                ProjectionOperationIndexSelector.Write
+                            projectionsEngine.AddProjectionBuilder(
+                                factory(sp, projectionsRepositoryFactory, ProjectionOperationIndexSelector.Write)
                             );
-
-                            projectionsEngine.AddProjectionBuilder(projectionBuilder);
                         }
-
-                        // No explicit StartAsync needed - InMemory observer subscribes in constructor
                     }
 
-                    return eventStore;
+                    return new InMemoryEventSourcingScope
+                    {
+                        EventStore = eventStore,
+                        EventsObserver = eventsObserver,
+                        ProjectionsEngine = projectionsEngine,
+                        MetadataRepository = new InMemoryMetadataRepository(itemsContainer),
+                        SequenceGenerator = new InMemorySequenceGenerator()
+                    };
                 }
             );
 
-            services.AddScoped<IMetadataRepository>(sp => new InMemoryMetadataRepository(itemsContainer));
-            services.AddScoped<ISequenceGenerator>(sp => new InMemorySequenceGenerator());
+            services.AddKeyedScoped<IEventStore>(
+                eventStoreKey,
+                (sp, key) => sp.GetRequiredKeyedService<InMemoryEventSourcingScope>(key).EventStore
+            );
+
+            services.AddKeyedScoped<EventsObserver>(
+                eventStoreKey,
+                (sp, key) => sp.GetRequiredKeyedService<InMemoryEventSourcingScope>(key).EventsObserver
+            );
+
+            services.AddKeyedScoped<AggregateRepositoryFactory>(
+                eventStoreKey,
+                (sp, key) => new AggregateRepositoryFactory(
+                    sp.GetRequiredKeyedService<InMemoryEventSourcingScope>(key).EventStore
+                )
+            );
+
+            services.AddKeyedScoped<IMetadataRepository>(
+                eventStoreKey,
+                (sp, key) => sp.GetRequiredKeyedService<InMemoryEventSourcingScope>(key).MetadataRepository
+            );
+
+            services.AddKeyedScoped<ISequenceGenerator>(
+                eventStoreKey,
+                (sp, key) => sp.GetRequiredKeyedService<InMemoryEventSourcingScope>(key).SequenceGenerator
+            );
 
             return builder;
         }
 
-        public static IEventSourcingBuilder AddInMemoryEventStore(this IServiceCollection services)
+        public static IEventSourcingBuilder AddInMemoryEventStore(
+            this IServiceCollection services,
+            string eventStoreKey = "in-memory"
+        )
         {
             return services.AddInMemoryEventStore(
+                eventStoreKey,
                 new ConcurrentDictionary<(Guid, string), List<string>>(),
                 new Dictionary<(string, string), string>()
             );
-        }
-
-        public static IEventSourcingBuilder AddRepository<TRepo>(this IEventSourcingBuilder builder)
-            where TRepo : class
-        {
-            builder.Services.AddScoped(
-                sp =>
-                {
-                    var eventStore = sp.GetRequiredService<IEventStore>();
-                    return ActivatorUtilities.CreateInstance<TRepo>(sp, new object[] { eventStore });
-                }
-            );
-
-            return builder;
         }
 
         public static IEventSourcingBuilder AddInMemoryProjections(
@@ -97,11 +125,14 @@ namespace CloudFabric.EventSourcing.AspNet.InMemory.Extensions
             var b = (EventSourcingBuilder)builder;
             b.ProjectionBuilderFactories = projectionBuilderFactories;
 
-            builder.Services.AddScoped<ProjectionRepositoryFactory>((sp) =>
-            {
-                var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-                return new InMemoryProjectionRepositoryFactory(loggerFactory);
-            });
+            builder.Services.AddKeyedScoped<ProjectionRepositoryFactory>(
+                builder.EventStoreKey,
+                (sp, key) =>
+                {
+                    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+                    return new InMemoryProjectionRepositoryFactory(loggerFactory);
+                }
+            );
 
             return builder;
         }

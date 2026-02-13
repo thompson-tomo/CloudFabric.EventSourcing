@@ -162,7 +162,9 @@ public static class ElasticSearchFilterFactory
         // Guid fields are mapped as Text in ES (TypeCode.Object → text with standard analyzer).
         // TermQuery doesn't analyze input, so it can't match tokenized Guid values.
         // Use MatchQuery which applies the field's analyzer to the input — works for both keyword and text fields.
-        var equalQuery = filter.Value is Guid
+        // Also handle string representations of Guids (e.g. treeId.ToString()).
+        var isGuidLike = filter.Value is Guid || (filter.Value is string s && Guid.TryParse(s, out _));
+        var equalQuery = isGuidLike
             ? (QueryContainer)new MatchQuery { Field = propertyName, Query = stringValue, Operator = Operator.And }
             : new TermQuery { Field = propertyName, Value = filter.Value };
 
