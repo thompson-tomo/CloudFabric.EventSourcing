@@ -3,6 +3,27 @@ import {FilterOperator} from "../../src/queries/FilterOperator";
 
 describe('Filter serialization', () => {
     it('Should correctly serialize and deserialize filter object', () => {
+        let filter = new Filter('name', FilterOperator.StartsWithIgnoreCase, 'a');
+        
+        // вот это шлём на бэк и вставляем в квери стринг, оно безопасное, все символы экранированы
+        let serializedString = filter.serialize();
+
+        // потом можно сделать так:
+        let filterDeserialized = Filter.deserialize(new URLSearchParams(window.location.search).get('filters'));
+        const newFilter = filterDeserialized.and(new Filter('tags', FilterOperator.Contains, 'basketball'));
+        
+        expect(serializedString).toEqual('userId|eq|1|F|basic%20test%20filter|');
+
+        let filterDeserialized = Filter.deserialize(serializedString);
+
+        expect(filterDeserialized.propertyName).toEqual(filter.propertyName);
+        expect(filterDeserialized.operator).toEqual(filter.operator);
+        expect(filterDeserialized.value).toEqual(filter.value);
+        expect(filterDeserialized.visible).toEqual(filter.visible);
+        expect(filterDeserialized.tag).toEqual(filter.tag);
+    });
+    
+    it('Should correctly serialize and deserialize filter object', () => {
         let filter = new Filter('userId', FilterOperator.Equal, 1);
         filter.tag = 'basic test filter';
         filter.visible = false;
