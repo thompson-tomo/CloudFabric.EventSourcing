@@ -13,14 +13,14 @@ public class EventSourcingBuilder : IEventSourcingBuilder
 
     public async Task InitializeEventStore(IServiceProvider serviceProvider)
     {
-        using var initScope = serviceProvider.CreateScope();
+        await using var initScope = serviceProvider.CreateAsyncScope();
         var eventStore = initScope.ServiceProvider.GetRequiredKeyedService<IEventStore>(EventStoreKey);
         await eventStore.Initialize();
     }
 
     public async Task EnsureProjectionIndexFor<T>(IServiceProvider serviceProvider) where T : ProjectionDocument
     {
-        using var initScope = serviceProvider.CreateScope();
+        await using var initScope = serviceProvider.CreateAsyncScope();
         var projectionsRepositoryFactory = initScope.ServiceProvider.GetRequiredKeyedService<ProjectionRepositoryFactory>(EventStoreKey);
         var projectionRepository = projectionsRepositoryFactory.GetProjectionRepository<T>();
         await projectionRepository.EnsureIndex();

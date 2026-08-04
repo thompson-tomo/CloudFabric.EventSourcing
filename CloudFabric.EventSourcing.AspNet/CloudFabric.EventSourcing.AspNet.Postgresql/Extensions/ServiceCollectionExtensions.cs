@@ -283,6 +283,39 @@ namespace CloudFabric.EventSourcing.AspNet.Postgresql.Extensions
         }
 
         /// <summary>
+        /// Adds a PostgreSQL-backed aggregate snapshot store and wires it into <see cref="AggregateRepositoryFactory"/>.
+        /// Chain after <see cref="AddPostgresqlEventStore"/>. Aggregates must override <c>SupportsSnapshots</c> to opt in.
+        /// </summary>
+        public static IEventSourcingBuilder AddPostgresqlSnapshotStore(
+            this IEventSourcingBuilder builder,
+            string connectionString,
+            string tableName = "aggregate_snapshots",
+            int snapshotThreshold = 50)
+        {
+            var eventStoreKey = builder.EventStoreKey;
+
+            // Register the snapshot store as a keyed service.
+            builder.Services.AddKeyedScoped<IAggregateSnapshotStore>(
+                eventStoreKey,
+                (sp, key) => new PostgresqlAggregateSnapshotStore(connectionString, tableName)
+            );
+
+            // Override the AggregateRepositoryFactory registration to include the snapshot store.
+            // In .NET's built-in DI, the last AddKeyedScoped registration wins for GetRequiredKeyedService.
+            builder.Services.AddKeyedScoped<AggregateRepositoryFactory>(
+                eventStoreKey,
+                (sp, key) =>
+                {
+                    var eventSourcingScope = sp.GetRequiredKeyedService<PostgresqlEventSourcingScope>(key);
+                    var snapshotStore = sp.GetRequiredKeyedService<IAggregateSnapshotStore>(key);
+                    return new AggregateRepositoryFactory(eventSourcingScope.EventStore, snapshotStore, snapshotThreshold);
+                }
+            );
+
+            return builder;
+        }
+
+        /// <summary>
         /// Adds health checks for PostgreSQL event store and projections connectivity.
         /// </summary>
         public static IHealthChecksBuilder AddPostgresqlEventSourcingHealthChecks(
