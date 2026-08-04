@@ -913,6 +913,67 @@ public abstract class OrderTests : TestsBaseWithProjections<OrderListProjectionI
         orders.Records.First().Document!.Name.Should().Be("Medium Order");
     }
 
+    [TestMethod]
+    public virtual async Task TestProjectionsQueryFilterThreeDistinctFilters()
+    {
+        var orderRepository = new OrderRepository(await GetEventStore());
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Order with "Test" prefix, 2 items, tagged
+        var order1 = new Order(Guid.NewGuid(), "Test Alpha Order", new List<OrderItem>
+        {
+            new OrderItem(DateTime.UtcNow, "A1", 10.00m),
+            new OrderItem(DateTime.UtcNow, "A2", 20.00m)
+        }, userId, "john@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order1);
+
+        // Order with "Test" prefix, 4 items, tagged
+        var order2 = new Order(Guid.NewGuid(), "Test Beta Order", new List<OrderItem>
+        {
+            new OrderItem(DateTime.UtcNow, "B1", 10.00m),
+            new OrderItem(DateTime.UtcNow, "B2", 20.00m),
+            new OrderItem(DateTime.UtcNow, "B3", 30.00m),
+            new OrderItem(DateTime.UtcNow, "B4", 40.00m)
+        }, userId, "jane@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order2);
+
+        // Order WITHOUT "Test" prefix, 3 items
+        var order3 = new Order(Guid.NewGuid(), "Gamma Order", new List<OrderItem>
+        {
+            new OrderItem(DateTime.UtcNow, "G1", 10.00m),
+            new OrderItem(DateTime.UtcNow, "G2", 20.00m),
+            new OrderItem(DateTime.UtcNow, "G3", 30.00m)
+        }, userId, "bob@gmail.com");
+        await orderRepository.SaveOrder(userInfo, order3);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // 3 distinct filters: search text "Test" + ItemsCount >= 3 + Tag == "" (empty)
+        // Only order2 matches: has "Test" in name, 4 items (>= 3), Tag is empty
+        var query = new ProjectionQuery
+        {
+            SearchText = "Test"
+        };
+        query.Filters.Add(new Filter
+        {
+            PropertyName = "ItemsCount",
+            Operator = FilterOperator.GreaterOrEqual,
+            Value = 3L
+        });
+        query.Filters.Add(new Filter
+        {
+            PropertyName = "Tag",
+            Operator = FilterOperator.Equal,
+            Value = ""
+        });
+
+        var results = await ProjectionsRepository.Query(query);
+        results.TotalRecordsFound.Should().Be(1);
+        results.Records.First().Document!.Name.Should().Be("Test Beta Order");
+    }
+
     #region Cross-Aggregate Event Tests
 
     [TestMethod]
@@ -1087,6 +1148,197 @@ public abstract class OrderTests : TestsBaseWithProjections<OrderListProjectionI
         rebuiltProj.Should().NotBeNull();
         rebuiltProj!.Tag.Should().Be("REBUILT_TAG");
         rebuiltProj.Name.Should().Be("Rebuild Cross-Agg Order");
+    }
+
+    #endregion
+
+    #region DeleteDocument Tests
+
+    [TestMethod]
+    public virtual async Task TestCancelOrder_DeletesProjection()
+    {
+        var orderRepository = new AggregateRepository<Order>(await GetEventStore());
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Create order
+        var order = new Order(Guid.NewGuid(), "Cancellable Order",
+            new List<OrderItem> { new OrderItem(DateTime.UtcNow, "Item", 10.00m) },
+            userId, "john@gmail.com");
+        await orderRepository.SaveAsync(userInfo, order);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Verify projection exists
+        var proj = await ProjectionsRepository.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
+        proj.Should().NotBeNull();
+        proj!.Name.Should().Be("Cancellable Order");
+
+        // Cancel order — should trigger DeleteDocument in projection builder
+        order.Cancel();
+        await orderRepository.SaveAsync(userInfo, order);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Projection should be deleted
+        var deleted = await ProjectionsRepository.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
+        deleted.Should().BeNull();
+
+        // Query should not find it
+        var queryResult = await ProjectionsRepository.Query(
+            ProjectionQueryExpressionExtensions.Where<OrderListProjectionItem>(d => d.Name == "Cancellable Order")
+        );
+        queryResult.TotalRecordsFound.Should().Be(0);
+    }
+
+    [TestMethod]
+    public virtual async Task TestCancelOrder_OtherOrdersUnaffected()
+    {
+        var orderRepository = new AggregateRepository<Order>(await GetEventStore());
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        var order1 = new Order(Guid.NewGuid(), "Order To Keep",
+            new List<OrderItem>(), userId, "john@gmail.com");
+        var order2 = new Order(Guid.NewGuid(), "Order To Cancel",
+            new List<OrderItem>(), userId, "jane@gmail.com");
+
+        await orderRepository.SaveAsync(userInfo, order1);
+        await orderRepository.SaveAsync(userInfo, order2);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // Cancel order2
+        order2.Cancel();
+        await orderRepository.SaveAsync(userInfo, order2);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        // order1 projection still exists
+        var proj1 = await ProjectionsRepository.Single(order1.Id, PartitionKeys.GetOrderPartitionKey());
+        proj1.Should().NotBeNull();
+        proj1!.Name.Should().Be("Order To Keep");
+
+        // order2 projection deleted
+        var proj2 = await ProjectionsRepository.Single(order2.Id, PartitionKeys.GetOrderPartitionKey());
+        proj2.Should().BeNull();
+    }
+
+    #endregion
+
+    #region AggregateUpdatedEvent Tests
+
+    [TestMethod]
+    public virtual async Task TestShipOrder_TriggersAggregateUpdatedEvent()
+    {
+        var orderRepository = new AggregateRepository<Order>(await GetEventStore());
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        // Create order
+        var order = new Order(Guid.NewGuid(), "Shippable Order",
+            new List<OrderItem> { new OrderItem(DateTime.UtcNow, "Widget", 25.00m) },
+            userId, "john@gmail.com");
+        await orderRepository.SaveAsync(userInfo, order);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        var projBefore = await ProjectionsRepository.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
+        projBefore.Should().NotBeNull();
+        var updatedAtBefore = projBefore!.UpdatedAt;
+
+        // Wait to ensure a different timestamp
+        await Task.Delay(100);
+
+        // Ship order — OrderShipped is NOT handled by OrdersListProjectionBuilder
+        // but AggregateUpdatedEvent<Order> IS, so UpdatedAt should be updated
+        order.Ship("TRACK-12345");
+        await orderRepository.SaveAsync(userInfo, order);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        var projAfter = await ProjectionsRepository.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
+        projAfter.Should().NotBeNull();
+        projAfter!.Name.Should().Be("Shippable Order");
+        projAfter.UpdatedAt.Should().BeAfter(updatedAtBefore);
+
+        // Verify the aggregate itself has the tracking number
+        var loadedOrder = await orderRepository.LoadAsync(order.Id, PartitionKeys.GetOrderPartitionKey());
+        loadedOrder.Should().NotBeNull();
+        loadedOrder!.TrackingNumber.Should().Be("TRACK-12345");
+    }
+
+    #endregion
+
+    #region AggregateRepositoryFactory Tests
+
+    [TestMethod]
+    public async Task TestAggregateRepositoryFactory()
+    {
+        var eventStore = await GetEventStore();
+        var factory = new AggregateRepositoryFactory(eventStore);
+
+        var repo = factory.GetAggregateRepository<Order>();
+
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+        var id = Guid.NewGuid();
+
+        var order = new Order(id, "Factory Test Order",
+            new List<OrderItem> { new OrderItem(DateTime.UtcNow, "FactoryItem", 5.00m) },
+            userId, "factory@test.com");
+
+        await repo.SaveAsync(userInfo, order);
+
+        var loaded = await repo.LoadAsync(id, PartitionKeys.GetOrderPartitionKey());
+        loaded.Should().NotBeNull();
+        loaded!.OrderName.Should().Be("Factory Test Order");
+        loaded.Items.Count.Should().Be(1);
+        loaded.Items[0].Name.Should().Be("FactoryItem");
+    }
+
+    #endregion
+
+    #region TransformResultDocuments Tests
+
+    [TestMethod]
+    public virtual async Task TestTransformResultDocuments()
+    {
+        var orderRepository = new OrderRepository(await GetEventStore());
+        var userId = Guid.NewGuid();
+        var userInfo = new EventUserInfo(userId);
+
+        var order1 = new Order(Guid.NewGuid(), "Transform Order 1",
+            new List<OrderItem>
+            {
+                new OrderItem(DateTime.UtcNow, "Item1", 10.00m),
+                new OrderItem(DateTime.UtcNow, "Item2", 20.00m)
+            }, userId, "john@gmail.com");
+
+        var order2 = new Order(Guid.NewGuid(), "Transform Order 2",
+            new List<OrderItem>(), userId, "jane@gmail.com");
+
+        await orderRepository.SaveOrder(userInfo, order1);
+        await orderRepository.SaveOrder(userInfo, order2);
+
+        await Task.Delay(ProjectionsUpdateDelay);
+
+        var result = await ProjectionsRepository.Query(new ProjectionQuery { Limit = 10 });
+        result.TotalRecordsFound.Should().Be(2);
+
+        // Transform to a simpler DTO
+        var transformed = result.TransformResultDocuments(item => new
+        {
+            item.Name,
+            item.ItemsCount
+        });
+
+        transformed.TotalRecordsFound.Should().Be(2);
+        transformed.Records.Count.Should().Be(2);
+
+        var names = transformed.Records.Select(r => r.Document!.Name).ToList();
+        names.Should().Contain("Transform Order 1");
+        names.Should().Contain("Transform Order 2");
     }
 
     #endregion

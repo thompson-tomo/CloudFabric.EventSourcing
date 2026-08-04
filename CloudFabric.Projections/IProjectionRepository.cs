@@ -61,6 +61,26 @@ public interface IProjectionRepository
     );
 
     /// <summary>
+    /// Performs a bulk update on nested array elements within documents matching the query.
+    /// For each matching document, iterates array elements, applies element-level filters,
+    /// and executes property updates (Set or ReplacePrefix) on matched elements.
+    /// Each backend uses its native mechanism: PostgreSQL: jsonb_agg + CASE, ElasticSearch: Painless script, InMemory: iterate and update.
+    /// </summary>
+    /// <param name="documentQuery">Filter conditions to select documents for update.</param>
+    /// <param name="partitionKey">Partition key to scope the update. Null means all partitions.</param>
+    /// <param name="nestedArrayUpdates">List of array update specifications.</param>
+    /// <param name="updatedAt">Timestamp to set on updated documents.</param>
+    /// <returns>Number of documents updated.</returns>
+    Task<long> UpdateNestedArrayByQuery(
+        ProjectionQuery documentQuery,
+        string? partitionKey,
+        List<NestedArrayUpdate> nestedArrayUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default,
+        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
+    );
+
+    /// <summary>
     /// Enters batch mode. Subsequent Upsert/Delete calls will be buffered instead of writing immediately.
     /// Call <see cref="FlushBatchAsync"/> to write all buffered operations as a single bulk operation.
     /// Thread-safe: can be used concurrently with live event processing.

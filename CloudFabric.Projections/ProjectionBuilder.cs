@@ -240,6 +240,20 @@ public class ProjectionBuilder : ProjectionBuilderBase
             .GetProjectionRepository(projectionDocumentSchema)
             .UpdateByQuery(query, partitionKey, propertyUpdates, updatedAt, cancellationToken, IndexSelector);
     }
+
+    protected Task<long> UpdateNestedArrayByQuery(
+        ProjectionDocumentSchema projectionDocumentSchema,
+        ProjectionQuery documentQuery,
+        string? partitionKey,
+        List<NestedArrayUpdate> nestedArrayUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
+    )
+    {
+        return ProjectionRepositoryFactory
+            .GetProjectionRepository(projectionDocumentSchema)
+            .UpdateNestedArrayByQuery(documentQuery, partitionKey, nestedArrayUpdates, updatedAt, cancellationToken, IndexSelector);
+    }
 }
 
 public class ProjectionBuilder<TDocument> : ProjectionBuilderBase, IProjectionBuilder<ProjectionDocument>

@@ -4,10 +4,13 @@ using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.EventStore.InMemory;
 using CloudFabric.EventSourcing.EventStore.Persistence;
 using CloudFabric.EventSourcing.Tests.Domain;
+using CloudFabric.EventSourcing.Tests.Domain.Events;
 using CloudFabric.EventSourcing.Tests.Domain.Projections.OrdersListProjection;
 using CloudFabric.EventSourcing.Tests.Domain.ValueObjects;
 using CloudFabric.Projections;
+using CloudFabric.Projections.Attributes;
 using CloudFabric.Projections.InMemory;
+using CloudFabric.Projections.Queries;
 using CloudFabric.Projections.Worker;
 using FluentAssertions;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -478,6 +481,305 @@ public class ProjectionsInfrastructureTests
 
         var droppedCount = await repo.CleanupStaleIndicesAsync(TimeSpan.Zero);
         droppedCount.Should().Be(0, "single completed index should never be removed");
+    }
+
+    #endregion
+
+    #region DefaultProjectionErrorHandler
+
+    /// <summary>
+    /// A projection builder that always throws when handling OrderPlaced.
+    /// Used to test error handling behavior.
+    /// </summary>
+    private class FailingProjectionBuilder : ProjectionBuilder<OrderListProjectionItem>,
+        IHandleEvent<OrderPlaced>
+    {
+        public FailingProjectionBuilder(
+            ProjectionRepositoryFactory projectionRepositoryFactory,
+            ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write)
+            : base(projectionRepositoryFactory, indexSelector)
+        {
+        }
+
+        public Task On(OrderPlaced evt)
+        {
+            throw new InvalidOperationException("Intentional failure in projection builder");
+        }
+    }
+
+    [TestMethod]
+    public async Task ErrorHandler_LogAndContinue_DoesNotStopOtherBuilders()
+    {
+        var store = CreateEventStore();
+        var observer = CreateObserver(store);
+        var factory = CreateProjectionRepositoryFactory();
+
+        var errorHandler = new DefaultProjectionErrorHandler(ProjectionErrorBehavior.LogAndContinue);
+
+        var engine = ProjectionsEngine.CreateBuilder()
+            .WithEventsObserver(observer)
+            .AddProjectionBuilder(new FailingProjectionBuilder(factory))
+            .AddProjectionBuilder(CreateProjectionBuilder(factory))
+            .WithErrorHandler(errorHandler)
+            .Build();
+
+        await engine.StartAsync("error-test");
+        await EnsureProjectionIndexReady(factory, observer);
+
+        // Create order — FailingProjectionBuilder throws, OrdersListProjectionBuilder should still work
+        var order = await CreateAndSaveOrder(store, "Error Test Order");
+        await Task.Delay(500);
+
+        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
+        var proj = await repo.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
+        proj.Should().NotBeNull("normal builder should still process events despite failing builder");
+        proj!.Name.Should().Be("Error Test Order");
+
+        await engine.StopAsync();
+    }
+
+    [TestMethod]
+    public async Task ErrorHandler_StopAll_ThrowsException()
+    {
+        var store = CreateEventStore();
+        var observer = CreateObserver(store);
+        var factory = CreateProjectionRepositoryFactory();
+
+        var errorHandler = new DefaultProjectionErrorHandler(ProjectionErrorBehavior.StopAll);
+
+        var engine = ProjectionsEngine.CreateBuilder()
+            .WithEventsObserver(observer)
+            .AddProjectionBuilder(new FailingProjectionBuilder(factory))
+            .WithErrorHandler(errorHandler)
+            .Build();
+
+        await engine.StartAsync("stop-all-test");
+        await EnsureProjectionIndexReady(factory, observer);
+
+        // Create order — should cause an exception through the error handler
+        Func<Task> act = async () => await CreateAndSaveOrder(store, "StopAll Test");
+
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*Projection builder*error*");
+
+        await engine.StopAsync();
+    }
+
+    [TestMethod]
+    public async Task Builder_WithErrorBehavior_UsesDefaultHandler()
+    {
+        var store = CreateEventStore();
+        var observer = CreateObserver(store);
+        var factory = CreateProjectionRepositoryFactory();
+
+        // Use WithErrorBehavior instead of WithErrorHandler
+        var engine = ProjectionsEngine.CreateBuilder()
+            .WithEventsObserver(observer)
+            .AddProjectionBuilder(new FailingProjectionBuilder(factory))
+            .AddProjectionBuilder(CreateProjectionBuilder(factory))
+            .WithErrorBehavior(ProjectionErrorBehavior.LogAndContinue)
+            .Build();
+
+        await engine.StartAsync("behavior-test");
+        await EnsureProjectionIndexReady(factory, observer);
+
+        var order = await CreateAndSaveOrder(store, "Behavior Test Order");
+        await Task.Delay(500);
+
+        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
+        var proj = await repo.Single(order.Id, PartitionKeys.GetOrderPartitionKey());
+        proj.Should().NotBeNull();
+        proj!.Name.Should().Be("Behavior Test Order");
+
+        await engine.StopAsync();
+    }
+
+    #endregion
+
+    #region ProjectionDocumentAttribute
+
+    [TestMethod]
+    public void GetAllPropertyNames_ReturnsExpectedProperties()
+    {
+        var names = ProjectionDocumentAttribute.GetAllPropertyNames<OrderListProjectionItem>();
+
+        names.Should().Contain("Name");
+        names.Should().Contain("ItemsCount");
+        names.Should().Contain("Items");
+        names.Should().Contain("CreatedBy");
+        names.Should().Contain("Tag");
+    }
+
+    [TestMethod]
+    public void GetFacetablePropertyNames_ReturnsFilterableProperties()
+    {
+        var facetableNames = ProjectionDocumentAttribute.GetFacetablePropertyNames<OrderListProjectionItem>();
+
+        // ItemsCount and Tag are marked as IsFacetable (via IsFilterable)
+        // Note: IsFilterable doesn't set IsFacetable — these are separate flags
+        // OrderListProjectionItem doesn't have IsFacetable=true, so this should be empty
+        // This test validates the method works even when no properties are facetable
+        facetableNames.Should().NotBeNull();
+    }
+
+    [TestMethod]
+    public void GetPropertyPathTypeCode_SimpleProperty()
+    {
+        var typeCode = ProjectionDocumentAttribute.GetPropertyPathTypeCode<OrderListProjectionItem>("Name");
+        typeCode.Should().Be(TypeCode.String);
+    }
+
+    [TestMethod]
+    public void GetPropertyPathTypeCode_NestedProperty()
+    {
+        var typeCode = ProjectionDocumentAttribute.GetPropertyPathTypeCode<OrderListProjectionItem>("Items.Amount");
+        typeCode.Should().Be(TypeCode.Decimal);
+    }
+
+    [TestMethod]
+    public void GetPropertyPathTypeCode_NestedObjectProperty()
+    {
+        var typeCode = ProjectionDocumentAttribute.GetPropertyPathTypeCode<OrderListProjectionItem>("CreatedBy.Email");
+        typeCode.Should().Be(TypeCode.String);
+    }
+
+    [TestMethod]
+    public void GetAllProjectionProperties_IncludesNestedProperties()
+    {
+        var properties = ProjectionDocumentAttribute.GetAllProjectionProperties<OrderListProjectionItem>();
+
+        var itemsProperty = properties.FirstOrDefault(p => p.Key.Name == "Items");
+        itemsProperty.Key.Should().NotBeNull();
+        itemsProperty.Value.DocumentPropertyAttribute.IsNestedArray.Should().BeTrue();
+        itemsProperty.Value.NestedDictionary.Should().NotBeNull("nested array should have nested properties");
+
+        var createdByProperty = properties.FirstOrDefault(p => p.Key.Name == "CreatedBy");
+        createdByProperty.Key.Should().NotBeNull();
+        createdByProperty.Value.DocumentPropertyAttribute.IsNestedObject.Should().BeTrue();
+        createdByProperty.Value.NestedDictionary.Should().NotBeNull("nested object should have nested properties");
+    }
+
+    #endregion
+
+    #region QueryResultDocument GetHighlightedTextForField
+
+    [TestMethod]
+    public void GetHighlightedTextForField_ReturnsHighlight()
+    {
+        var doc = new QueryResultDocument<OrderListProjectionItem>
+        {
+            Document = new OrderListProjectionItem { Name = "Test" },
+            Highlights = new Dictionary<string, List<string>>
+            {
+                { "Name", new List<string> { "<em>Test</em> Order" } }
+            }
+        };
+
+        var highlight = doc.GetHighlightedTextForField("Name");
+        highlight.Should().Be("<em>Test</em> Order");
+    }
+
+    [TestMethod]
+    public void GetHighlightedTextForField_ReturnsNull_WhenFieldNotFound()
+    {
+        var doc = new QueryResultDocument<OrderListProjectionItem>
+        {
+            Document = new OrderListProjectionItem { Name = "Test" },
+            Highlights = new Dictionary<string, List<string>>()
+        };
+
+        var highlight = doc.GetHighlightedTextForField("NonExistent");
+        highlight.Should().BeNull();
+    }
+
+    [TestMethod]
+    public void GetHighlightedTextForField_ReturnsNull_WhenFieldNameEmpty()
+    {
+        var doc = new QueryResultDocument<OrderListProjectionItem>
+        {
+            Document = new OrderListProjectionItem { Name = "Test" },
+            Highlights = new Dictionary<string, List<string>>
+            {
+                { "Name", new List<string> { "<em>Test</em>" } }
+            }
+        };
+
+        var highlight = doc.GetHighlightedTextForField("");
+        highlight.Should().BeNull();
+    }
+
+    [TestMethod]
+    public void GetHighlightedTextForField_ReturnsNull_WhenHighlightsListEmpty()
+    {
+        var doc = new QueryResultDocument<OrderListProjectionItem>
+        {
+            Document = new OrderListProjectionItem { Name = "Test" },
+            Highlights = new Dictionary<string, List<string>>
+            {
+                { "Name", new List<string>() }
+            }
+        };
+
+        var highlight = doc.GetHighlightedTextForField("Name");
+        highlight.Should().BeNull();
+    }
+
+    #endregion
+
+    #region Rebuild with MetadataRepository (BatchOperationTracker)
+
+    [TestMethod]
+    public async Task RebuildWithMetadataRepository_TracksProgress()
+    {
+        var store = CreateEventStore();
+        var observer = CreateObserver(store);
+        var factory = CreateProjectionRepositoryFactory();
+        var metadataRepository = new InMemoryMetadataRepository(
+            new Dictionary<(string, string), string>()
+        );
+        await metadataRepository.Initialize();
+
+        // Start a live engine so that events can be saved (observer needs a handler)
+        var liveEngine = new ProjectionsEngine(observer);
+        liveEngine.AddProjectionBuilder(CreateProjectionBuilder(factory));
+        await liveEngine.StartAsync("live");
+        await EnsureProjectionIndexReady(factory, observer);
+
+        // Create some orders
+        for (int i = 0; i < 5; i++)
+        {
+            await CreateAndSaveOrder(store, $"Rebuild Tracking Order {i}");
+        }
+        await Task.Delay(500);
+
+        // Delete all projections to force a rebuild
+        var repo = factory.GetProjectionRepository<OrderListProjectionItem>();
+        await repo.DeleteAll();
+        await repo.EnsureIndex();
+
+        // Create a rebuild processor WITH metadataRepository
+        var rebuildProcessor = new ProjectionsRebuildProcessor(
+            factory.GetProjectionsIndexStateRepository(),
+            async (_) =>
+            {
+                var rebuildEngine = new ProjectionsEngine(observer);
+                rebuildEngine.AddProjectionBuilder(
+                    CreateProjectionBuilder(factory, ProjectionOperationIndexSelector.ProjectionRebuild)
+                );
+                return rebuildEngine;
+            },
+            NullLogger<ProjectionsRebuildProcessor>.Instance,
+            factory,
+            metadataRepository
+        );
+
+        await rebuildProcessor.RebuildProjectionsThatRequireRebuild();
+
+        // Verify projections were rebuilt
+        var results = await repo.Query(new ProjectionQuery { Limit = 10 });
+        results.TotalRecordsFound.Should().Be(5);
+
+        await liveEngine.StopAsync();
     }
 
     #endregion

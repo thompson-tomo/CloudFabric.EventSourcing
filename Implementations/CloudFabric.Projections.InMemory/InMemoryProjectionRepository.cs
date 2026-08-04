@@ -322,6 +322,145 @@ public class InMemoryProjectionRepository : ProjectionRepository
         return Task.FromResult((long)materialized.Count);
     }
 
+    protected override Task<long> UpdateNestedArrayByQueryInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        ProjectionQuery documentQuery,
+        string? partitionKey,
+        List<NestedArrayUpdate> nestedArrayUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (!_storage.TryGetValue(indexDescriptor.IndexName, out var storage))
+        {
+            return Task.FromResult(0L);
+        }
+
+        var documents = storage
+            .Where(x => string.IsNullOrEmpty(partitionKey) || x.Key.PartitionKey == partitionKey)
+            .Select(x => x.Value)
+            .AsEnumerable();
+
+        var expression = documentQuery.FiltersToExpression<Dictionary<string, object?>>();
+        if (expression != null)
+        {
+            documents = documents.Where(expression.Compile());
+        }
+
+        var materialized = documents.ToList();
+        long updatedCount = 0;
+
+        foreach (var doc in materialized)
+        {
+            var docModified = false;
+
+            foreach (var arrayUpdate in nestedArrayUpdates)
+            {
+                if (!doc.TryGetValue(arrayUpdate.ArrayPropertyName, out var arrayValue) || arrayValue == null)
+                {
+                    continue;
+                }
+
+                // CategoryPaths is stored as List<Dictionary<string, object?>> which is not
+                // assignable to List<object?> (C# lists are not covariant).
+                // Use IEnumerable to iterate regardless of the concrete list type.
+                var enumerable = arrayValue as System.Collections.IEnumerable;
+                if (enumerable == null)
+                {
+                    continue;
+                }
+
+                foreach (var item in enumerable)
+                {
+                    if (item is not Dictionary<string, object?> element)
+                    {
+                        continue;
+                    }
+
+                    if (!MatchesElementFilters(element, arrayUpdate.ElementMatchFilters))
+                    {
+                        continue;
+                    }
+
+                    foreach (var propUpdate in arrayUpdate.ElementUpdates)
+                    {
+                        if (propUpdate.Condition != null
+                            && !MatchesElementFilter(element, propUpdate.Condition))
+                        {
+                            continue;
+                        }
+
+                        switch (propUpdate.UpdateType)
+                        {
+                            case PropertyUpdateType.Set:
+                                element[propUpdate.PropertyName] = propUpdate.Value;
+                                docModified = true;
+                                break;
+
+                            case PropertyUpdateType.ReplacePrefix:
+                                if (element.TryGetValue(propUpdate.PropertyName, out var currentVal)
+                                    && currentVal is string currentStr
+                                    && propUpdate.OldPrefix != null
+                                    && propUpdate.NewPrefix != null
+                                    && currentStr.StartsWith(propUpdate.OldPrefix))
+                                {
+                                    element[propUpdate.PropertyName] =
+                                        propUpdate.NewPrefix + currentStr[propUpdate.OldPrefix.Length..];
+                                    docModified = true;
+                                }
+                                break;
+                        }
+                    }
+                }
+            }
+
+            if (docModified)
+            {
+                doc[nameof(ProjectionDocument.UpdatedAt)] = updatedAt;
+                updatedCount++;
+            }
+        }
+
+        return Task.FromResult(updatedCount);
+    }
+
+    private static bool MatchesElementFilters(Dictionary<string, object?> element, List<Filter> filters)
+    {
+        foreach (var filter in filters)
+        {
+            if (!MatchesElementFilter(element, filter))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool MatchesElementFilter(Dictionary<string, object?> element, Filter filter)
+    {
+        if (string.IsNullOrEmpty(filter.PropertyName) || string.IsNullOrEmpty(filter.Operator))
+        {
+            return true;
+        }
+
+        if (!element.TryGetValue(filter.PropertyName, out var value))
+        {
+            return false;
+        }
+
+        var valueStr = value?.ToString() ?? "";
+        var filterValueStr = filter.Value?.ToString() ?? "";
+
+        return filter.Operator switch
+        {
+            FilterOperator.Equal => valueStr == filterValueStr,
+            FilterOperator.NotEqual => valueStr != filterValueStr,
+            FilterOperator.StartsWith => valueStr.StartsWith(filterValueStr),
+            FilterOperator.Contains => valueStr.Contains(filterValueStr),
+            _ => false
+        };
+    }
+
     private class NullLastComparer : IComparer<object?>
     {
         public static readonly NullLastComparer Instance = new();

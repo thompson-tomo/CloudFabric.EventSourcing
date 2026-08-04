@@ -390,6 +390,30 @@ public abstract class ProjectionRepository : IProjectionRepository
         CancellationToken cancellationToken = default
     );
 
+    public async Task<long> UpdateNestedArrayByQuery(
+        ProjectionQuery documentQuery,
+        string? partitionKey,
+        List<NestedArrayUpdate> nestedArrayUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default,
+        ProjectionOperationIndexSelector indexSelector = ProjectionOperationIndexSelector.Write
+    )
+    {
+        if (_isBatchMode) await FlushBatchAsync(cancellationToken);
+
+        var indexDescriptor = await GetIndexDescriptorForOperation(indexSelector, cancellationToken);
+        return await UpdateNestedArrayByQueryInternal(indexDescriptor, documentQuery, partitionKey, nestedArrayUpdates, updatedAt, cancellationToken);
+    }
+
+    protected abstract Task<long> UpdateNestedArrayByQueryInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        ProjectionQuery documentQuery,
+        string? partitionKey,
+        List<NestedArrayUpdate> nestedArrayUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
+    );
+
     protected async Task<IReadOnlyCollection<ProjectionIndexState>> QueryProjectionIndexStates(
         ProjectionQuery projectionQuery, 
         CancellationToken cancellationToken = default

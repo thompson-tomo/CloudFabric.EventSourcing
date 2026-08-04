@@ -977,6 +977,232 @@ public class PostgresqlProjectionRepository : ProjectionRepository
         }, cancellationToken);
     }
 
+    protected override async Task<long> UpdateNestedArrayByQueryInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        ProjectionQuery documentQuery,
+        string? partitionKey,
+        List<NestedArrayUpdate> nestedArrayUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
+    )
+    {
+        indexDescriptor.ProjectionDocumentSchema ??= ProjectionDocumentSchema;
+
+        var parameters = new List<NpgsqlParameter>();
+        var paramIdx = 0;
+
+        // === SET clauses: one per array update ===
+        var setClauses = new List<string>();
+
+        foreach (var arrayUpdate in nestedArrayUpdates)
+        {
+            var elemAlias = $"_elem{paramIdx}";
+
+            // Element match conditions
+            var matchParts = new List<string>();
+            foreach (var filter in arrayUpdate.ElementMatchFilters)
+            {
+                matchParts.Add(BuildElemFilterSql(elemAlias, filter, parameters, ref paramIdx));
+            }
+            var matchExpr = matchParts.Count > 0 ? string.Join(" AND ", matchParts) : "TRUE";
+
+            // Build update expression by chaining jsonb_set calls
+            var updateExpr = elemAlias;
+            foreach (var propUpdate in arrayUpdate.ElementUpdates)
+            {
+                var innerExpr = BuildPropUpdateSql(updateExpr, elemAlias, propUpdate, parameters, ref paramIdx);
+
+                if (propUpdate.Condition != null)
+                {
+                    var condExpr = BuildElemFilterSql(elemAlias, propUpdate.Condition, parameters, ref paramIdx);
+                    updateExpr = $"CASE WHEN {condExpr} THEN {innerExpr} ELSE {updateExpr} END";
+                }
+                else
+                {
+                    updateExpr = innerExpr;
+                }
+            }
+
+            setClauses.Add(
+                $"\"{arrayUpdate.ArrayPropertyName}\" = (" +
+                $"SELECT jsonb_agg(CASE WHEN {matchExpr} THEN {updateExpr} ELSE {elemAlias} END) " +
+                $"FROM jsonb_array_elements(t.\"{arrayUpdate.ArrayPropertyName}\") {elemAlias})"
+            );
+        }
+
+        setClauses.Add($"\"{nameof(ProjectionDocument.UpdatedAt)}\" = @na_upd");
+        parameters.Add(new NpgsqlParameter("na_upd", updatedAt) { NpgsqlDbType = NpgsqlDbType.TimestampTz });
+
+        // === WHERE clause ===
+        var whereParts = new List<string>();
+
+        if (!string.IsNullOrEmpty(partitionKey))
+        {
+            whereParts.Add($"\"{nameof(ProjectionDocument.PartitionKey)}\" = @na_pk");
+            parameters.Add(new NpgsqlParameter("na_pk", partitionKey));
+        }
+
+        // Group document-level filters: nested array filters → EXISTS subquery, direct → simple condition
+        var existsGroups = new Dictionary<string, List<(string nestedProp, Filter filter)>>();
+        var directFilters = new List<Filter>();
+
+        foreach (var filter in documentQuery.Filters)
+        {
+            if (filter.PropertyName != null && filter.PropertyName.Contains('.'))
+            {
+                var dotIdx = filter.PropertyName.IndexOf('.');
+                var arrayProp = filter.PropertyName[..dotIdx];
+                var nestedProp = filter.PropertyName[(dotIdx + 1)..];
+
+                if (!existsGroups.ContainsKey(arrayProp))
+                    existsGroups[arrayProp] = new List<(string, Filter)>();
+
+                existsGroups[arrayProp].Add((nestedProp, filter));
+            }
+            else
+            {
+                directFilters.Add(filter);
+            }
+        }
+
+        foreach (var (arrayProp, filters) in existsGroups)
+        {
+            var chkAlias = $"_chk{paramIdx}";
+            var existsParts = new List<string>();
+
+            foreach (var (nestedProp, filter) in filters)
+            {
+                var nestedFilter = new Filter(nestedProp, filter.Operator!, filter.Value);
+                existsParts.Add(BuildElemFilterSql(chkAlias, nestedFilter, parameters, ref paramIdx));
+            }
+
+            whereParts.Add(
+                $"EXISTS (SELECT 1 FROM jsonb_array_elements(t.\"{arrayProp}\") {chkAlias} " +
+                $"WHERE {string.Join(" AND ", existsParts)})"
+            );
+        }
+
+        foreach (var filter in directFilters)
+        {
+            var pName = $"df{paramIdx}";
+            parameters.Add(new NpgsqlParameter(pName, filter.Value ?? DBNull.Value));
+            paramIdx++;
+
+            var op = filter.Operator switch
+            {
+                FilterOperator.Equal => filter.Value == null ? "IS NULL" : $"= @{pName}",
+                FilterOperator.StartsWith => $"LIKE @{pName} || '%'",
+                _ => $"= @{pName}"
+            };
+            whereParts.Add($"\"{filter.PropertyName}\" {op}");
+        }
+
+        // === Assemble SQL ===
+        var sb = new StringBuilder();
+        sb.Append($"UPDATE \"{indexDescriptor.IndexName}\" t SET ");
+        sb.Append(string.Join(", ", setClauses));
+
+        if (whereParts.Count > 0)
+        {
+            sb.Append(" WHERE ");
+            sb.Append(string.Join(" AND ", whereParts));
+        }
+
+        return await _retryPipeline.ExecuteAsync(async (ct) =>
+        {
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync(ct);
+
+            try
+            {
+                await using var cmd = new NpgsqlCommand(sb.ToString(), conn);
+                cmd.Parameters.AddRange(parameters.Select(p => p.Clone()).ToArray());
+                return (long)await cmd.ExecuteNonQueryAsync(ct);
+            }
+            catch (NpgsqlException ex)
+            {
+                if (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.UndefinedColumn)
+                {
+                    throw new InvalidProjectionSchemaException(ex);
+                }
+
+                throw new Exception(
+                    $"Error executing UpdateNestedArrayByQuery on \"{indexDescriptor.IndexName}\": {sb}",
+                    ex
+                );
+            }
+        }, cancellationToken);
+    }
+
+    private static string BuildElemFilterSql(
+        string elemAlias, Filter filter,
+        List<NpgsqlParameter> parameters, ref int paramIdx)
+    {
+        var propAccess = $"{elemAlias}->>'{filter.PropertyName}'";
+        var pName = $"ef{paramIdx}";
+        paramIdx++;
+
+        switch (filter.Operator)
+        {
+            case FilterOperator.Equal:
+                if (filter.Value == null)
+                {
+                    return $"({propAccess}) IS NULL";
+                }
+                parameters.Add(new NpgsqlParameter(pName, filter.Value.ToString()!));
+                return $"({propAccess}) = @{pName}";
+
+            case FilterOperator.StartsWith:
+                parameters.Add(new NpgsqlParameter(pName, filter.Value?.ToString() ?? ""));
+                return $"({propAccess}) LIKE @{pName} || '%'";
+
+            case FilterOperator.NotEqual:
+                if (filter.Value == null)
+                {
+                    return $"({propAccess}) IS NOT NULL";
+                }
+                parameters.Add(new NpgsqlParameter(pName, filter.Value.ToString()!));
+                return $"({propAccess}) != @{pName}";
+
+            default:
+                throw new ArgumentException($"Unsupported filter operator for nested array element: {filter.Operator}");
+        }
+    }
+
+    private static string BuildPropUpdateSql(
+        string baseExpr, string elemAlias, PropertyUpdate update,
+        List<NpgsqlParameter> parameters, ref int paramIdx)
+    {
+        switch (update.UpdateType)
+        {
+            case PropertyUpdateType.Set:
+            {
+                var pName = $"pus{paramIdx}";
+                paramIdx++;
+                if (update.Value == null)
+                {
+                    return $"jsonb_set({baseExpr}, '{{{update.PropertyName}}}', 'null'::jsonb)";
+                }
+                parameters.Add(new NpgsqlParameter(pName, update.Value.ToString()!));
+                return $"jsonb_set({baseExpr}, '{{{update.PropertyName}}}', to_jsonb(@{pName}::text))";
+            }
+
+            case PropertyUpdateType.ReplacePrefix:
+            {
+                var oldP = $"puo{paramIdx}";
+                var newP = $"pun{paramIdx}";
+                paramIdx++;
+                parameters.Add(new NpgsqlParameter(oldP, update.OldPrefix ?? ""));
+                parameters.Add(new NpgsqlParameter(newP, update.NewPrefix ?? ""));
+                return $"jsonb_set({baseExpr}, '{{{update.PropertyName}}}', " +
+                       $"to_jsonb(@{newP} || substr({elemAlias}->>'{update.PropertyName}', length(@{oldP}) + 1)))";
+            }
+
+            default:
+                throw new ArgumentException($"Unsupported property update type: {update.UpdateType}");
+        }
+    }
+
     private QueryChunk ConstructOneConditionFilter(Filter filter, ProjectionDocumentSchema schema)
     {
         var queryChunk = new QueryChunk();

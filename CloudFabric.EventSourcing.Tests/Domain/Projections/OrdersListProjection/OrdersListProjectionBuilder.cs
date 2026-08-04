@@ -9,6 +9,7 @@ public class OrdersListProjectionBuilder : ProjectionBuilder<OrderListProjection
     IHandleEvent<OrderItemAdded>,
     IHandleEvent<OrderItemRemoved>,
     IHandleEvent<OrderNameUpdated>,
+    IHandleEvent<OrderCancelled>,
     IHandleEvent<AggregateUpdatedEvent<Order>>,
     IHandleCrossAggregateEvent<BulkOrderTagChanged>
 {
@@ -92,6 +93,11 @@ public class OrdersListProjectionBuilder : ProjectionBuilder<OrderListProjection
             {
                 orderProjection.Name = evt.NewOrderName;
             });
+    }
+
+    public async Task On(OrderCancelled evt)
+    {
+        await DeleteDocument(evt.AggregateId, evt.PartitionKey);
     }
 
     public async Task On(AggregateUpdatedEvent<Order> evt)

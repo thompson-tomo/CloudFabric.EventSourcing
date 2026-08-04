@@ -10,6 +10,7 @@ using Microsoft.Extensions.Logging;
 using Nest;
 using Polly;
 using SortOrder = Nest.SortOrder;
+using Filter = CloudFabric.Projections.Queries.Filter;
 
 namespace CloudFabric.Projections.ElasticSearch;
 
@@ -762,6 +763,158 @@ public class ElasticSearchProjectionRepository : ProjectionRepository
                 throw;
             }
         }, cancellationToken);
+    }
+
+    protected override async Task<long> UpdateNestedArrayByQueryInternal(
+        ProjectionOperationIndexDescriptor indexDescriptor,
+        ProjectionQuery documentQuery,
+        string? partitionKey,
+        List<NestedArrayUpdate> nestedArrayUpdates,
+        DateTime updatedAt,
+        CancellationToken cancellationToken = default
+    )
+    {
+        return await ExecuteWithRetriesAsync(async (ct) =>
+        {
+            try
+            {
+                var scriptParts = new List<string>();
+                var scriptParams = new Dictionary<string, object?>();
+
+                foreach (var arrayUpdate in nestedArrayUpdates)
+                {
+                    var arrayName = arrayUpdate.ArrayPropertyName;
+
+                    // Build element match condition
+                    var matchConditions = new List<string>();
+                    foreach (var filter in arrayUpdate.ElementMatchFilters)
+                    {
+                        matchConditions.Add(BuildPainlessCondition("item", filter, scriptParams));
+                    }
+                    var matchExpr = matchConditions.Count > 0 ? string.Join(" && ", matchConditions) : "true";
+
+                    // Build update statements for matched elements
+                    var updateStatements = new List<string>();
+                    foreach (var propUpdate in arrayUpdate.ElementUpdates)
+                    {
+                        var stmt = BuildPainlessUpdate("item", propUpdate, scriptParams);
+                        if (propUpdate.Condition != null)
+                        {
+                            var condExpr = BuildPainlessCondition("item", propUpdate.Condition, scriptParams);
+                            stmt = $"if ({condExpr}) {{ {stmt} }}";
+                        }
+                        updateStatements.Add(stmt);
+                    }
+
+                    var loopBody = string.Join(" ", updateStatements);
+
+                    scriptParts.Add(
+                        $"if (ctx._source.{arrayName} != null) {{ " +
+                        $"for (int i = 0; i < ctx._source.{arrayName}.size(); i++) {{ " +
+                        $"def item = ctx._source.{arrayName}[i]; " +
+                        $"if ({matchExpr}) {{ {loopBody} }} " +
+                        $"}} }}"
+                    );
+                }
+
+                // Update timestamp
+                scriptParts.Add($"ctx._source.{nameof(ProjectionDocument.UpdatedAt)} = params._updatedAt");
+                scriptParams["_updatedAt"] = updatedAt;
+
+                // Build filter query
+                var filters = documentQuery.Filters != null && documentQuery.Filters.Any()
+                    ? ElasticSearchFilterFactory.ConstructFilters(documentQuery.Filters, _projectionDocumentSchema)
+                    : new List<QueryContainer>();
+
+                if (!string.IsNullOrEmpty(partitionKey))
+                {
+                    filters.Add(new TermQuery
+                    {
+                        Field = nameof(ProjectionDocument.PartitionKey),
+                        Value = partitionKey
+                    });
+                }
+
+                await _client.Indices.RefreshAsync(indexDescriptor.IndexName, ct: ct);
+
+                var response = await _client.UpdateByQueryAsync<Dictionary<string, object?>>(u =>
+                {
+                    u = u.Index(indexDescriptor.IndexName)
+                        .Query(q => q.Bool(b => new BoolQuery { Filter = filters }))
+                        .Script(s => s
+                            .Source(string.Join(" ", scriptParts))
+                            .Params(scriptParams!)
+                        )
+                        .Refresh();
+
+                    if (!string.IsNullOrEmpty(partitionKey))
+                    {
+                        u = u.Routing(partitionKey);
+                    }
+
+                    return u;
+                }, ct);
+
+                return response.Updated;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to execute UpdateNestedArrayByQuery on ({@Index})", indexDescriptor.IndexName);
+                throw;
+            }
+        }, cancellationToken);
+    }
+
+    private static string BuildPainlessCondition(
+        string varName, Filter filter, Dictionary<string, object?> scriptParams)
+    {
+        var propAccess = $"{varName}.{filter.PropertyName}";
+        var paramKey = $"_f_{filter.PropertyName}_{scriptParams.Count}";
+
+        switch (filter.Operator)
+        {
+            case FilterOperator.Equal:
+                scriptParams[paramKey] = filter.Value?.ToString();
+                return $"{propAccess} == params.{paramKey}";
+
+            case FilterOperator.StartsWith:
+                scriptParams[paramKey] = filter.Value?.ToString() ?? "";
+                return $"{propAccess} != null && {propAccess}.startsWith(params.{paramKey})";
+
+            case FilterOperator.NotEqual:
+                scriptParams[paramKey] = filter.Value?.ToString();
+                return $"{propAccess} != params.{paramKey}";
+
+            default:
+                throw new ArgumentException($"Unsupported filter operator for Painless script: {filter.Operator}");
+        }
+    }
+
+    private static string BuildPainlessUpdate(
+        string varName, PropertyUpdate update, Dictionary<string, object?> scriptParams)
+    {
+        switch (update.UpdateType)
+        {
+            case PropertyUpdateType.Set:
+            {
+                var paramKey = $"_u_{update.PropertyName}_{scriptParams.Count}";
+                scriptParams[paramKey] = update.Value;
+                return $"{varName}.{update.PropertyName} = params.{paramKey};";
+            }
+
+            case PropertyUpdateType.ReplacePrefix:
+            {
+                var oldKey = $"_rpo_{update.PropertyName}_{scriptParams.Count}";
+                var newKey = $"_rpn_{update.PropertyName}_{scriptParams.Count + 1}";
+                scriptParams[oldKey] = update.OldPrefix ?? "";
+                scriptParams[newKey] = update.NewPrefix ?? "";
+                return $"{varName}.{update.PropertyName} = params.{newKey} + " +
+                       $"{varName}.{update.PropertyName}.substring(params.{oldKey}.length());";
+            }
+
+            default:
+                throw new ArgumentException($"Unsupported property update type for Painless script: {update.UpdateType}");
+        }
     }
 
     private QueryContainer ConstructSearchQuery<T>(QueryContainerDescriptor<T> searchDescriptor, ProjectionQuery projectionQuery) where T : class
