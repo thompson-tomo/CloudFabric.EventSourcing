@@ -76,6 +76,11 @@ public abstract class AggregateBase
             {
                 Version += 1;
             }
+
+            if (@event.Timestamp > LastAppliedEventTimestamp)
+            {
+                LastAppliedEventTimestamp = @event.Timestamp;
+            }
         }
     }
 
@@ -148,5 +153,82 @@ public abstract class AggregateBase
     protected virtual void RaiseEvent(IEvent @event)
     {
         ((dynamic)this).On((dynamic)@event);
+    }
+
+    // -------------------------------------------------------------------------
+    // Snapshot support (opt-in)
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Timestamp of the last event (own or cross-aggregate) applied during event replay.
+    /// Set by the constructor when replaying events, and updated by <see cref="ApplyHistoricalEvent"/>.
+    /// Used by <see cref="AggregateRepository{T}"/> to determine which cross-aggregate events
+    /// have already been captured in a snapshot and therefore do not need to be replayed again.
+    /// </summary>
+    public DateTime LastAppliedEventTimestamp { get; private set; }
+
+    /// <summary>
+    /// Returns true if this aggregate supports snapshot serialization/deserialization.
+    /// Override in derived classes and return true together with implementations of
+    /// <see cref="CreateSnapshot"/> and <see cref="RestoreFromSnapshot"/>.
+    /// </summary>
+    public virtual bool SupportsSnapshots => false;
+
+    /// <summary>
+    /// Serializes the aggregate's current state to a JSON string for snapshot storage.
+    /// Override in derived classes that support snapshots.
+    /// </summary>
+    public virtual string CreateSnapshot() =>
+        throw new NotSupportedException(
+            $"{GetType().Name} does not implement CreateSnapshot(). " +
+            "Override SupportsSnapshots, CreateSnapshot, and RestoreFromSnapshot to enable snapshot support."
+        );
+
+    /// <summary>
+    /// Restores the aggregate's state from a previously created snapshot JSON string.
+    /// Override in derived classes that support snapshots. The override must restore all
+    /// domain state including the aggregate <see cref="Id"/>.
+    /// </summary>
+    protected virtual void RestoreFromSnapshot(string stateJson) =>
+        throw new NotSupportedException(
+            $"{GetType().Name} does not implement RestoreFromSnapshot(). " +
+            "Override SupportsSnapshots, CreateSnapshot, and RestoreFromSnapshot to enable snapshot support."
+        );
+
+    /// <summary>
+    /// Called by <see cref="AggregateRepository{T}"/> to restore the aggregate from a snapshot.
+    /// Initializes state, version, and the last-applied timestamp without replaying any events.
+    /// </summary>
+    internal void InitFromSnapshot(string stateJson, int version, DateTime lastAppliedEventTimestamp)
+    {
+        RestoreFromSnapshot(stateJson);
+        Version = version;
+        LastAppliedEventTimestamp = lastAppliedEventTimestamp;
+    }
+
+    /// <summary>
+    /// Called by <see cref="AggregateRepository{T}"/> to replay a single historical event on an
+    /// aggregate that was already initialized from a snapshot. Updates <see cref="Version"/> and
+    /// <see cref="LastAppliedEventTimestamp"/> accordingly.
+    /// </summary>
+    internal void ApplyHistoricalEvent(IEvent @event)
+    {
+        // If Id was not set by snapshot restoration (e.g. blank aggregate), derive it from the first own event.
+        if (@event is not ICrossAggregateEvent && Id == Guid.Empty)
+        {
+            Id = @event.AggregateId;
+        }
+
+        RaiseEvent(@event);
+
+        if (@event is not ICrossAggregateEvent)
+        {
+            Version++;
+        }
+
+        if (@event.Timestamp > LastAppliedEventTimestamp)
+        {
+            LastAppliedEventTimestamp = @event.Timestamp;
+        }
     }
 }

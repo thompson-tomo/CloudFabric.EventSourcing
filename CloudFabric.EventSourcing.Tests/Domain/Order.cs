@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Text.Json;
 using CloudFabric.EventSourcing.Domain;
 using CloudFabric.EventSourcing.EventStore;
 using CloudFabric.EventSourcing.Tests.Domain.Events;
@@ -22,6 +23,8 @@ public class Order : AggregateBase
 
     public string OrderName { get; private set; } = string.Empty;
     public string Tag { get; private set; } = string.Empty;
+    public bool IsCancelled { get; private set; }
+    public string TrackingNumber { get; private set; } = string.Empty;
 
     /// <summary>
     /// It should not be possible to modify the collection from outside.
@@ -39,11 +42,21 @@ public class Order : AggregateBase
     public void RemoveItem(string name)
     {
         var item = Items.FirstOrDefault(x => x.Name == name);
-        
+
         if (item != null)
         {
             Apply(new OrderItemRemoved(Id, item, PartitionKey));
         }
+    }
+
+    public void Cancel()
+    {
+        Apply(new OrderCancelled(Id, PartitionKey));
+    }
+
+    public void Ship(string trackingNumber)
+    {
+        Apply(new OrderShipped(Id, trackingNumber, PartitionKey));
     }
 
     #region Event Handlers
@@ -87,5 +100,52 @@ public class Order : AggregateBase
         UpdatedAt = @event.Timestamp;
     }
 
+    public void On(OrderCancelled @event)
+    {
+        IsCancelled = true;
+        UpdatedAt = @event.Timestamp;
+    }
+
+    public void On(OrderShipped @event)
+    {
+        TrackingNumber = @event.TrackingNumber;
+        UpdatedAt = @event.Timestamp;
+    }
+
     #endregion
+
+    // -------------------------------------------------------------------------
+    // Snapshot support
+    // -------------------------------------------------------------------------
+
+    private record OrderSnapshotState(
+        Guid Id,
+        string OrderName,
+        List<OrderItem> Items,
+        string Tag,
+        bool IsCancelled,
+        string TrackingNumber,
+        Guid CreatedById,
+        DateTime UpdatedAt);
+
+    public override bool SupportsSnapshots => true;
+
+    public override string CreateSnapshot() =>
+        JsonSerializer.Serialize(new OrderSnapshotState(
+            Id, OrderName, new List<OrderItem>(Items),
+            Tag, IsCancelled, TrackingNumber, CreatedById, UpdatedAt));
+
+    protected override void RestoreFromSnapshot(string stateJson)
+    {
+        var s = JsonSerializer.Deserialize<OrderSnapshotState>(stateJson)
+            ?? throw new InvalidOperationException("Failed to deserialize Order snapshot.");
+        Id = s.Id;
+        OrderName = s.OrderName;
+        Items = s.Items.AsReadOnly();
+        Tag = s.Tag;
+        IsCancelled = s.IsCancelled;
+        TrackingNumber = s.TrackingNumber;
+        CreatedById = s.CreatedById;
+        UpdatedAt = s.UpdatedAt;
+    }
 }

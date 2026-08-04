@@ -6,10 +6,25 @@ namespace CloudFabric.EventSourcing.Domain;
 public class AggregateRepository<T> : IAggregateRepository<T> where T : AggregateBase
 {
     private readonly IEventStore _eventStore;
+    private readonly IAggregateSnapshotStore? _snapshotStore;
+
+    /// <summary>
+    /// Number of own events between snapshot saves. When the aggregate's version after a successful
+    /// <see cref="SaveAsync"/> is a multiple of this threshold, a new snapshot is persisted.
+    /// Ignored when <paramref name="snapshotStore"/> is null or the aggregate does not support snapshots.
+    /// </summary>
+    private readonly int _snapshotThreshold;
 
     public AggregateRepository(IEventStore eventStore)
+        : this(eventStore, null, 50)
+    {
+    }
+
+    public AggregateRepository(IEventStore eventStore, IAggregateSnapshotStore? snapshotStore, int snapshotThreshold = 50)
     {
         _eventStore = eventStore;
+        _snapshotStore = snapshotStore;
+        _snapshotThreshold = snapshotThreshold;
     }
 
     public async Task<T?> LoadAsync(Guid id, string partitionKey, CancellationToken cancellationToken = default)
@@ -19,6 +34,14 @@ public class AggregateRepository<T> : IAggregateRepository<T> where T : Aggregat
             throw new ArgumentNullException(nameof(id));
         }
 
+        // Try snapshot-based load first if a snapshot store is configured.
+        if (_snapshotStore != null)
+        {
+            var fromSnapshot = await TryLoadFromSnapshotAsync(id, partitionKey, cancellationToken);
+            if (fromSnapshot != null) return fromSnapshot;
+        }
+
+        // Fall back to full event replay.
         var eventStream = await _eventStore.LoadStreamAsync(id, partitionKey, cancellationToken);
 
         if (!eventStream.Events.Any()) return null;
@@ -34,10 +57,76 @@ public class AggregateRepository<T> : IAggregateRepository<T> where T : Aggregat
             throw new ArgumentNullException(nameof(id));
         }
 
+        // Try snapshot-based load first if a snapshot store is configured.
+        if (_snapshotStore != null)
+        {
+            var fromSnapshot = await TryLoadFromSnapshotAsync(id, partitionKey, cancellationToken);
+            if (fromSnapshot != null) return fromSnapshot;
+        }
+
+        // Fall back to full event replay.
         var eventStream = await _eventStore.LoadStreamAsyncOrThrowNotFound(id, partitionKey, cancellationToken);
 
         var mergedEvents = await MergeWithGlobalEvents(eventStream, partitionKey, cancellationToken);
         return ConstructAggregateInstanceFromEvents(eventStream, mergedEvents);
+    }
+
+    /// <summary>
+    /// Attempts to load the aggregate from a snapshot + remaining events.
+    /// Returns null if no snapshot is available or the aggregate type does not support snapshots,
+    /// indicating that the caller should fall back to full event replay.
+    /// </summary>
+    private async Task<T?> TryLoadFromSnapshotAsync(
+        Guid id,
+        string partitionKey,
+        CancellationToken cancellationToken)
+    {
+        var snapshot = await _snapshotStore!.LoadLatestSnapshotAsync(id, partitionKey, cancellationToken);
+        if (snapshot == null) return null;
+
+        // Resolve the concrete aggregate type from the snapshot metadata.
+        var type = Type.GetType(snapshot.AggregateType, AggregateTypeAssemblyResolver, null) ?? typeof(T);
+
+        // Create an aggregate instance via the default constructor to check snapshot support.
+        T? aggregate;
+        try
+        {
+            aggregate = (T?)Activator.CreateInstance(type);
+        }
+        catch
+        {
+            // No default constructor — cannot restore from snapshot; fall back to full replay.
+            return null;
+        }
+
+        if (aggregate == null || !aggregate.SupportsSnapshots) return null;
+
+        // Restore state from the snapshot.
+        aggregate.InitFromSnapshot(snapshot.StateJson, snapshot.Version, snapshot.LastAppliedEventTimestamp);
+
+        // Load own events that occurred after the snapshot version.
+        var remainingOwnStream = await _eventStore.LoadStreamAsync(
+            id, partitionKey, snapshot.Version + 1, cancellationToken);
+
+        // Load global (cross-aggregate) events, keeping only those that postdate the snapshot.
+        var allGlobalEvents = await _eventStore.LoadGlobalEventsAsync(
+            snapshot.AggregateType, partitionKey, cancellationToken);
+
+        var newGlobalEvents = allGlobalEvents
+            .Where(e => e.Timestamp > snapshot.LastAppliedEventTimestamp)
+            .ToList();
+
+        // Merge remaining own events and new global events by timestamp, then replay.
+        var remainingEvents = remainingOwnStream.Events
+            .Concat(newGlobalEvents)
+            .OrderBy(e => e.Timestamp);
+
+        foreach (var @event in remainingEvents)
+        {
+            aggregate.ApplyHistoricalEvent(@event);
+        }
+
+        return aggregate;
     }
 
     /// <summary>
@@ -106,7 +195,7 @@ public class AggregateRepository<T> : IAggregateRepository<T> where T : Aggregat
         assemblyName.Version = null;
         return System.Reflection.Assembly.Load(assemblyName);
     }
-    
+
     public async Task<bool> SaveAsync(EventUserInfo eventUserInfo, T aggregate, CancellationToken cancellationToken = default)
     {
         if (aggregate.UncommittedEvents.Any())
@@ -117,6 +206,10 @@ public class AggregateRepository<T> : IAggregateRepository<T> where T : Aggregat
             {
                 e.AggregateType = aggregate.GetType().AssemblyQualifiedName ?? "";
             }
+
+            // Capture the max timestamp of the uncommitted events before they are cleared by OnChangesSaved().
+            // This is used to compute the snapshot's LastAppliedEventTimestamp.
+            var uncommittedMaxTimestamp = aggregate.UncommittedEvents.Max(e => e.Timestamp);
 
             var eventsSavedSuccessfully = await _eventStore.AppendToStreamAsync(
                 eventUserInfo,
@@ -129,6 +222,41 @@ public class AggregateRepository<T> : IAggregateRepository<T> where T : Aggregat
             if (eventsSavedSuccessfully)
             {
                 aggregate.OnChangesSaved();
+
+                // Optionally persist a snapshot after every N own events.
+                if (_snapshotStore != null
+                    && aggregate.SupportsSnapshots
+                    && _snapshotThreshold > 0
+                    && aggregate.Version % _snapshotThreshold == 0)
+                {
+                    try
+                    {
+                        // LastAppliedEventTimestamp is the later of:
+                        //   (a) the max timestamp of events applied during the last LoadAsync, and
+                        //   (b) the max timestamp of the events just committed.
+                        var snapshotTimestamp = uncommittedMaxTimestamp > aggregate.LastAppliedEventTimestamp
+                            ? uncommittedMaxTimestamp
+                            : aggregate.LastAppliedEventTimestamp;
+
+                        await _snapshotStore.SaveSnapshotAsync(
+                            new AggregateSnapshot
+                            {
+                                StreamId = aggregate.Id,
+                                PartitionKey = aggregate.PartitionKey,
+                                AggregateType = aggregate.GetType().AssemblyQualifiedName ?? "",
+                                Version = aggregate.Version,
+                                StateJson = aggregate.CreateSnapshot(),
+                                LastAppliedEventTimestamp = snapshotTimestamp
+                            },
+                            cancellationToken
+                        );
+                    }
+                    catch
+                    {
+                        // A snapshot save failure is non-fatal: the aggregate events were committed
+                        // successfully and the next load will still work via full event replay.
+                    }
+                }
             }
 
             return eventsSavedSuccessfully;
